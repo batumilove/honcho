@@ -322,6 +322,12 @@ class OpenAIBackend:
             ):
                 if key in extra_params:
                     params[key] = extra_params[key]
+            # Pass through unrecognized provider_params via extra_body
+            # for vLLM chat_template_kwargs etc.
+            _known = {"top_p", "frequency_penalty", "presence_penalty", "seed", "verbosity", "json_mode"}
+            for _k, _v in extra_params.items():
+                if _k not in _known:
+                    params.setdefault("extra_body", {})[_k] = _v
         return params
 
     def _normalize_response(
