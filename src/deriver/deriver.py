@@ -1,8 +1,11 @@
 import logging
+import os
 import time
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from src import crud
-from src.config import ConfiguredModelSettings, settings
+from src.config import ConfiguredModelSettings, ModelOverrideSettings, settings
 from src.crud.representation import RepresentationManager
 from src.dependencies import tracked_db
 from src.llm import honcho_llm_call
@@ -33,6 +36,128 @@ def _get_deriver_model_config() -> ConfiguredModelSettings:
     return settings.DERIVER.MODEL_CONFIG
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using %d", name, raw, default)
+        return default
+
+
+def _env_json_dict(name: str) -> dict[str, Any]:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return {}
+    try:
+        import json
+
+        value = json.loads(raw)
+    except Exception as exc:
+        logger.warning("Invalid JSON for %s: %s", name, exc)
+        return {}
+    if not isinstance(value, dict):
+        logger.warning("Invalid JSON for %s: expected object, got %s", name, type(value).__name__)
+        return {}
+    return value
+
+
+def _build_fast_deriver_model_config(
+    base_model_config: ConfiguredModelSettings,
+) -> ConfiguredModelSettings | None:
+    """Build optional fast deriver model config from env.
+
+    This intentionally lives outside AppSettings so operators can canary a fast
+    backend without changing Honcho's public config schema. Missing transport,
+    API key env, token cap, etc. inherit from the safe primary config.
+    """
+    model = os.getenv("DERIVER_ROUTER_FAST_MODEL")
+    base_url = os.getenv("DERIVER_ROUTER_FAST_BASE_URL")
+    if not model or not base_url:
+        return None
+
+    return ConfiguredModelSettings(
+        transport=os.getenv("DERIVER_ROUTER_FAST_TRANSPORT") or base_model_config.transport,
+        model=model,
+        temperature=base_model_config.temperature,
+        top_p=base_model_config.top_p,
+        top_k=base_model_config.top_k,
+        frequency_penalty=base_model_config.frequency_penalty,
+        presence_penalty=base_model_config.presence_penalty,
+        seed=base_model_config.seed,
+        thinking_effort=base_model_config.thinking_effort,
+        thinking_budget_tokens=base_model_config.thinking_budget_tokens,
+        max_output_tokens=_env_int(
+            "DERIVER_ROUTER_FAST_MAX_OUTPUT_TOKENS",
+            base_model_config.max_output_tokens or settings.LLM.DEFAULT_MAX_TOKENS,
+        ),
+        stop_sequences=base_model_config.stop_sequences,
+        cache_policy=base_model_config.cache_policy,
+        overrides=ModelOverrideSettings(
+            api_key=os.getenv("DERIVER_ROUTER_FAST_API_KEY") or None,
+            api_key_env=os.getenv("DERIVER_ROUTER_FAST_API_KEY_ENV")
+            or base_model_config.overrides.api_key_env,
+            base_url=base_url,
+            provider_params=_env_json_dict("DERIVER_ROUTER_FAST_PROVIDER_PARAMS"),
+        ),
+    )
+
+
+def _choose_deriver_model_config(
+    *,
+    base_model_config: ConfiguredModelSettings,
+    messages: list[Message],
+    queued_message_count: int,
+    messages_tokens: int,
+    hit_batch_token_cap: bool,
+    had_previous_error: bool,
+) -> tuple[ConfiguredModelSettings, str]:
+    """Route deriver work by shape.
+
+    Safe model remains default. Fast model is used only for small, fresh,
+    first-attempt work units. Large, backfill/old, token-cap-hit, and retry/error
+    work goes to the safe structured-output model.
+    """
+    if not _env_bool("DERIVER_ROUTER_ENABLED", False):
+        return base_model_config, "safe:router-disabled"
+
+    fast_model_config = _build_fast_deriver_model_config(base_model_config)
+    if fast_model_config is None:
+        return base_model_config, "safe:fast-config-missing"
+
+    if had_previous_error:
+        return base_model_config, "safe:retry-or-error"
+    if hit_batch_token_cap:
+        return base_model_config, "safe:hit-batch-token-cap"
+
+    max_messages = _env_int("DERIVER_ROUTER_FAST_MAX_QUEUED_MESSAGES", 1)
+    if queued_message_count > max_messages:
+        return base_model_config, f"safe:queued-messages>{max_messages}"
+
+    max_tokens = _env_int("DERIVER_ROUTER_FAST_MAX_MESSAGE_TOKENS", 512)
+    if messages_tokens > max_tokens:
+        return base_model_config, f"safe:message-tokens>{max_tokens}"
+
+    newest_allowed_age_hours = _env_int("DERIVER_ROUTER_FAST_MAX_AGE_HOURS", 24)
+    if newest_allowed_age_hours > 0 and messages:
+        latest_created_at = max(m.created_at for m in messages)
+        if latest_created_at.tzinfo is None:
+            latest_created_at = latest_created_at.replace(tzinfo=UTC)
+        if latest_created_at < datetime.now(UTC) - timedelta(hours=newest_allowed_age_hours):
+            return base_model_config, f"safe:older-than-{newest_allowed_age_hours}h"
+
+    return fast_model_config, "fast:small-fresh-first-attempt"
+
+
 @with_sentry_transaction("minimal_deriver_batch", op="deriver")
 async def process_representation_tasks_batch(
     messages: list[Message],
@@ -44,6 +169,7 @@ async def process_representation_tasks_batch(
     hit_batch_token_cap: bool = False,
     was_flush_enabled: bool = False,
     batch_max_tokens: int = 0,
+    had_previous_error: bool = False,
 ) -> None:
     """
     Process messages with minimal overhead - single LLM call, save to multiple collections.
@@ -57,6 +183,7 @@ async def process_representation_tasks_batch(
         hit_batch_token_cap: queue batcher clamped this batch to fit
         was_flush_enabled: DERIVER.FLUSH_ENABLED snapshot at batch time
         batch_max_tokens: DERIVER.REPRESENTATION_BATCH_MAX_TOKENS snapshot
+        had_previous_error: True when any queue item in this batch previously errored.
     """
     if not messages:
         return
@@ -138,8 +265,38 @@ async def process_representation_tasks_batch(
 
     # validation on settings means max_tokens will always be > 0
     base_model_config = _get_deriver_model_config()
-    max_tokens = base_model_config.max_output_tokens or settings.LLM.DEFAULT_MAX_TOKENS
-    model_config = base_model_config
+    model_config, router_decision = _choose_deriver_model_config(
+        base_model_config=base_model_config,
+        messages=messages,
+        queued_message_count=len(queue_item_message_ids),
+        messages_tokens=messages_tokens,
+        hit_batch_token_cap=hit_batch_token_cap,
+        had_previous_error=had_previous_error,
+    )
+    max_tokens = model_config.max_output_tokens or settings.LLM.DEFAULT_MAX_TOKENS
+    logger.info(
+        "Deriver router selected %s/%s at %s for messages %s:%s (%s, queued=%d, tokens=%d)",
+        model_config.transport,
+        model_config.model,
+        model_config.overrides.base_url,
+        earliest_message.id,
+        latest_message.id,
+        router_decision,
+        len(queue_item_message_ids),
+        messages_tokens,
+    )
+    accumulate_metric(
+        f"minimal_deriver_{latest_message.id}_{observed}",
+        "router_decision",
+        router_decision,
+        "label",
+    )
+    accumulate_metric(
+        f"minimal_deriver_{latest_message.id}_{observed}",
+        "router_model",
+        model_config.model,
+        "label",
+    )
 
     # Single LLM call
     llm_start = time.perf_counter()

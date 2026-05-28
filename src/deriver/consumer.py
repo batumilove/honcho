@@ -161,6 +161,7 @@ async def process_representation_batch(
     hit_batch_token_cap: bool = False,
     was_flush_enabled: bool = False,
     batch_max_tokens: int = 0,
+    had_previous_error: bool = False,
 ) -> None:
     """
     Prepares and processes a batch of messages for representation tasks.
@@ -174,6 +175,7 @@ async def process_representation_batch(
         hit_batch_token_cap: whether the queue batcher clamped this batch to fit
         was_flush_enabled: snapshot of DERIVER.FLUSH_ENABLED at fetch time
         batch_max_tokens: DERIVER.REPRESENTATION_BATCH_MAX_TOKENS snapshot
+        had_previous_error: True when any queue item in this batch previously errored.
     """
     if not messages or not messages[0]:
         logger.debug("process_representation_batch received no messages")
@@ -191,6 +193,7 @@ async def process_representation_batch(
         hit_batch_token_cap=hit_batch_token_cap,
         was_flush_enabled=was_flush_enabled,
         batch_max_tokens=batch_max_tokens,
+        had_previous_error=had_previous_error,
     )
 
 

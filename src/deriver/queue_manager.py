@@ -525,6 +525,7 @@ class QueueManager:
                                     hit_batch_token_cap=batch_result.hit_batch_token_cap,
                                     was_flush_enabled=batch_result.was_flush_enabled,
                                     batch_max_tokens=batch_result.batch_max_tokens,
+                                    had_previous_error=any(item.error for item in items_to_process),
                                 )
                                 await self.mark_queue_items_as_processed(
                                     items_to_process, work_unit_key
