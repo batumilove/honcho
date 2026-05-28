@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import time
@@ -118,6 +119,7 @@ def _choose_deriver_model_config(
     messages: list[Message],
     queued_message_count: int,
     messages_tokens: int,
+    prompt_message_tokens: int,
     hit_batch_token_cap: bool,
     had_previous_error: bool,
 ) -> tuple[ConfiguredModelSettings, str]:
@@ -136,8 +138,10 @@ def _choose_deriver_model_config(
 
     if had_previous_error:
         return base_model_config, "safe:retry-or-error"
-    if hit_batch_token_cap:
-        return base_model_config, "safe:hit-batch-token-cap"
+
+    max_prompt_tokens = _env_int("DERIVER_ROUTER_FAST_MAX_PROMPT_MESSAGE_TOKENS", 2048)
+    if prompt_message_tokens > max_prompt_tokens:
+        return base_model_config, f"safe:prompt-message-tokens>{max_prompt_tokens}"
 
     max_messages = _env_int("DERIVER_ROUTER_FAST_MAX_QUEUED_MESSAGES", 1)
     if queued_message_count > max_messages:
@@ -270,6 +274,7 @@ async def process_representation_tasks_batch(
         messages=messages,
         queued_message_count=len(queue_item_message_ids),
         messages_tokens=messages_tokens,
+        prompt_message_tokens=sum(msg.token_count for msg in messages),
         hit_batch_token_cap=hit_batch_token_cap,
         had_previous_error=had_previous_error,
     )
@@ -300,7 +305,7 @@ async def process_representation_tasks_batch(
 
     # Single LLM call
     llm_start = time.perf_counter()
-    response = await honcho_llm_call(
+    llm_call = honcho_llm_call(
         model_config=model_config,
         prompt=prompt,
         max_tokens=max_tokens,
@@ -318,6 +323,13 @@ async def process_representation_tasks_batch(
             observed=observed,
         ),
     )
+    if router_decision.startswith("fast:"):
+        response = await asyncio.wait_for(
+            llm_call,
+            timeout=_env_int("DERIVER_ROUTER_FAST_TIMEOUT_SECONDS", 30),
+        )
+    else:
+        response = await llm_call
     llm_duration = (time.perf_counter() - llm_start) * 1000
 
     accumulate_metric(
