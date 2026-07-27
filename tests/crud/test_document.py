@@ -414,6 +414,7 @@ class TestDocumentCRUD:
         )
         document = schemas.DocumentCreate(
             content="Observation\x00 one",
+            source_ids=["document\x00-source"],
             embedding=[0.1] * 1536,
             session_name=test_session.name,
             level="deductive",
@@ -421,6 +422,7 @@ class TestDocumentCRUD:
                 message_ids=[1],
                 message_created_at="2024-01-01T00:00:00Z",
                 premises=["Premise\x00 one", "Premise two"],
+                source_ids=["metadata\x00-source"],
             ),
         )
 
@@ -446,6 +448,8 @@ class TestDocumentCRUD:
             "Premise one",
             "Premise two",
         ]
+        assert persisted.internal_metadata["source_ids"] == ["metadata-source"]
+        assert persisted.source_ids == ["document-source"]
 
     @pytest.mark.asyncio
     async def test_create_documents_drops_content_emptied_by_nul_removal(
