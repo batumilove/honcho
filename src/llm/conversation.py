@@ -168,13 +168,40 @@ def truncate_messages_to_fit(
         logger.warning("No valid conversation units")
         return system_messages
 
-    # Drop oldest units until conversation fits, but keep at least one unit so
-    # we never erase the entire non-system conversation.
+    # Preserve the most recent real user query. Tool loops can otherwise evict
+    # their only user message while retaining recent assistant/tool units,
+    # producing an invalid provider request (for example, Qwen/vLLM rejects it
+    # with "No user query found in messages"). Tool-result messages may use the
+    # user role for Anthropic/Gemini shapes, so they do not qualify.
+    user_query_unit = next(
+        (
+            unit
+            for unit in reversed(units)
+            if any(
+                msg.get("role") == "user" and not _is_tool_result_message(msg)
+                for msg in unit
+            )
+        ),
+        None,
+    )
+
+    # Drop oldest removable units until the conversation fits. Always preserve
+    # the latest unit and, when present, the most recent real user query.
     while len(units) > 1:
         flat_messages = [m for unit in units for m in unit]
         if count_message_tokens(flat_messages) <= available_tokens:
             break
-        removed_unit = units.pop(0)
+        removable_index = next(
+            (
+                index
+                for index, unit in enumerate(units[:-1])
+                if unit is not user_query_unit
+            ),
+            None,
+        )
+        if removable_index is None:
+            break
+        removed_unit = units.pop(removable_index)
         logger.debug(
             "Dropping conversation unit with "
             + f"{len(removed_unit)} messages "
