@@ -60,6 +60,17 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_model_transport(name: str, default: ModelTransport) -> ModelTransport:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    value = raw.strip().lower()
+    if value in {"anthropic", "openai", "gemini"}:
+        return cast(ModelTransport, value)
+    logger.warning("Invalid model transport for %s=%r; using %s", name, raw, default)
+    return default
+
+
 def _env_json_dict(name: str) -> dict[str, Any]:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -67,12 +78,14 @@ def _env_json_dict(name: str) -> dict[str, Any]:
     try:
         import json
 
-        value = json.loads(raw)
+        value: object = json.loads(raw)
     except Exception as exc:
         logger.warning("Invalid JSON for %s: %s", name, exc)
         return {}
     if not isinstance(value, dict):
-        logger.warning("Invalid JSON for %s: expected object, got %s", name, type(value).__name__)
+        logger.warning(
+            "Invalid JSON for %s: expected object, got %s", name, type(value).__name__
+        )
         return {}
     return cast(dict[str, Any], value)
 
@@ -92,10 +105,8 @@ def _build_fast_deriver_model_config(
         return None
 
     return ConfiguredModelSettings(
-        transport=cast(
-            ModelTransport,
-            os.getenv("DERIVER_ROUTER_FAST_TRANSPORT")
-            or base_model_config.transport,
+        transport=_env_model_transport(
+            "DERIVER_ROUTER_FAST_TRANSPORT", base_model_config.transport
         ),
         model=model,
         temperature=base_model_config.temperature,
@@ -168,7 +179,9 @@ def _choose_deriver_model_config(
         latest_created_at = max(m.created_at for m in messages)
         if latest_created_at.tzinfo is None:
             latest_created_at = latest_created_at.replace(tzinfo=UTC)
-        if latest_created_at < datetime.now(UTC) - timedelta(hours=newest_allowed_age_hours):
+        if latest_created_at < datetime.now(UTC) - timedelta(
+            hours=newest_allowed_age_hours
+        ):
             return base_model_config, f"safe:older-than-{newest_allowed_age_hours}h"
 
     return fast_model_config, "fast:small-fresh-first-attempt"
