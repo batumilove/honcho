@@ -401,3 +401,48 @@ class TestDocumentCRUD:
         assert len(documents) == 2
         assert documents[0].content in ["Observation 1", "Observation 2"]
         assert documents[1].content in ["Observation 1", "Observation 2"]
+
+    @pytest.mark.asyncio
+    async def test_create_documents_removes_nul_from_nested_text_fields(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        test_workspace, test_peer = sample_data
+        test_peer2, test_session, _ = await self._setup_test_data(
+            db_session, test_workspace, test_peer
+        )
+        document = schemas.DocumentCreate(
+            content="Observation\x00 one",
+            embedding=[0.1] * 1536,
+            session_name=test_session.name,
+            level="deductive",
+            metadata=schemas.DocumentMetadata(
+                message_ids=[1],
+                message_created_at="2024-01-01T00:00:00Z",
+                premises=["Premise\x00 one", "Premise two"],
+            ),
+        )
+
+        accepted = await crud.create_documents(
+            db_session,
+            documents=[document],
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=test_peer2.name,
+        )
+
+        assert len(accepted) == 1
+        result = await db_session.execute(
+            select(models.Document).where(
+                models.Document.workspace_name == test_workspace.name,
+                models.Document.observer == test_peer.name,
+                models.Document.observed == test_peer2.name,
+            )
+        )
+        persisted = result.scalar_one()
+        assert persisted.content == "Observation one"
+        assert persisted.internal_metadata["premises"] == [
+            "Premise one",
+            "Premise two",
+        ]

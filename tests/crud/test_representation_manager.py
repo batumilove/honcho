@@ -183,6 +183,73 @@ class TestRepresentationManagerSoftDelete:
 
 class TestRepresentationManagerSave:
     @pytest.mark.asyncio
+    async def test_save_representation_removes_nul_before_embedding_and_persistence(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        manager = RepresentationManager(
+            "workspace",
+            observer="observer",
+            observed="observed",
+        )
+        representation = Representation(
+            explicit=[
+                ExplicitObservation(
+                    content=" useful\x00 observation ",
+                    created_at=datetime.now(timezone.utc),
+                    message_ids=[1],
+                    session_name="session",
+                )
+            ],
+            deductive=[
+                DeductiveObservation(
+                    conclusion=" inferred\x00 conclusion ",
+                    premises=[" premise\x00 one ", "premise two"],
+                    source_ids=["doc-a"],
+                    created_at=datetime.now(timezone.utc),
+                    message_ids=[1],
+                    session_name="session",
+                )
+            ],
+        )
+
+        with (
+            patch("src.crud.representation.tracked_db", _fake_tracked_db),
+            patch(
+                "src.crud.representation.embedding_client.simple_batch_embed",
+                new=AsyncMock(return_value=[[0.1], [0.2]]),
+            ) as mock_embed,
+            patch.object(
+                manager,
+                "_save_representation_internal",
+                new=AsyncMock(return_value=2),
+            ) as mock_save,
+        ):
+            saved = await manager.save_representation(
+                representation,
+                message_ids=[1],
+                session_name="session",
+                message_created_at=datetime.now(timezone.utc),
+                message_level_configuration=_resolved_config(),
+            )
+
+        assert saved == 2
+        mock_embed.assert_awaited_once_with(
+            ["inferred conclusion", "useful observation"]
+        )
+        saved_observations = _saved_observations(mock_save)
+        deductive = next(
+            obs for obs in saved_observations if isinstance(obs, DeductiveObservation)
+        )
+        explicit = next(
+            obs for obs in saved_observations if isinstance(obs, ExplicitObservation)
+        )
+        assert deductive.conclusion == "inferred conclusion"
+        assert deductive.premises == [" premise one ", "premise two"]
+        assert explicit.content == "useful observation"
+        assert "Removed 3 NUL byte(s) from generated representation" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_save_representation_filters_blank_observations_before_embedding(
         self,
     ):
@@ -306,6 +373,12 @@ class TestRepresentationManagerSave:
                 ),
                 ExplicitObservation(
                     content="\n\t ",
+                    created_at=datetime.now(timezone.utc),
+                    message_ids=[1],
+                    session_name="session",
+                ),
+                ExplicitObservation(
+                    content="\x00\x00",
                     created_at=datetime.now(timezone.utc),
                     message_ids=[1],
                     session_name="session",
