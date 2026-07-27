@@ -3,10 +3,15 @@ import logging
 import os
 import time
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from src import crud
-from src.config import ConfiguredModelSettings, ModelOverrideSettings, settings
+from src.config import (
+    ConfiguredModelSettings,
+    ModelOverrideSettings,
+    ModelTransport,
+    settings,
+)
 from src.crud.representation import RepresentationManager
 from src.dependencies import tracked_db
 from src.llm import honcho_llm_call
@@ -69,7 +74,7 @@ def _env_json_dict(name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         logger.warning("Invalid JSON for %s: expected object, got %s", name, type(value).__name__)
         return {}
-    return value
+    return cast(dict[str, Any], value)
 
 
 def _build_fast_deriver_model_config(
@@ -87,7 +92,11 @@ def _build_fast_deriver_model_config(
         return None
 
     return ConfiguredModelSettings(
-        transport=os.getenv("DERIVER_ROUTER_FAST_TRANSPORT") or base_model_config.transport,
+        transport=cast(
+            ModelTransport,
+            os.getenv("DERIVER_ROUTER_FAST_TRANSPORT")
+            or base_model_config.transport,
+        ),
         model=model,
         temperature=base_model_config.temperature,
         top_p=base_model_config.top_p,
@@ -138,6 +147,9 @@ def _choose_deriver_model_config(
 
     if had_previous_error:
         return base_model_config, "safe:retry-or-error"
+
+    if hit_batch_token_cap:
+        return base_model_config, "safe:batch-token-cap"
 
     max_prompt_tokens = _env_int("DERIVER_ROUTER_FAST_MAX_PROMPT_MESSAGE_TOKENS", 2048)
     if prompt_message_tokens > max_prompt_tokens:
