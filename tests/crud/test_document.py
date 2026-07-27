@@ -446,3 +446,43 @@ class TestDocumentCRUD:
             "Premise one",
             "Premise two",
         ]
+
+    @pytest.mark.asyncio
+    async def test_create_documents_drops_content_emptied_by_nul_removal(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        caplog: pytest.LogCaptureFixture,
+    ):
+        test_workspace, test_peer = sample_data
+        test_peer2, test_session, _ = await self._setup_test_data(
+            db_session, test_workspace, test_peer
+        )
+        document = schemas.DocumentCreate(
+            content="\x00\x00",
+            embedding=[0.1] * 1536,
+            session_name=test_session.name,
+            metadata=schemas.DocumentMetadata(
+                message_ids=[1],
+                message_created_at="2024-01-01T00:00:00Z",
+            ),
+        )
+
+        accepted = await crud.create_documents(
+            db_session,
+            documents=[document],
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=test_peer2.name,
+        )
+
+        assert accepted == []
+        result = await db_session.execute(
+            select(models.Document).where(
+                models.Document.workspace_name == test_workspace.name,
+                models.Document.observer == test_peer.name,
+                models.Document.observed == test_peer2.name,
+            )
+        )
+        assert result.scalars().all() == []
+        assert "Dropped document whose content became empty after NUL removal" in caplog.text

@@ -489,6 +489,11 @@ async def create_documents(
                     "Removed %d NUL byte(s) from document text fields before persistence",
                     nul_count,
                 )
+            if not content:
+                logger.warning(
+                    "Dropped document whose content became empty after NUL removal"
+                )
+                continue
 
             sanitized_doc = doc.model_copy(
                 update={
