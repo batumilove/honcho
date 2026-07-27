@@ -49,6 +49,15 @@ from .types import (
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+_CONTINUITY_USER_MESSAGE = "Continue the original request using the retained context."
+
+
+def _raise_if_tool_loop_input_over_cap(tokens: int, max_input_tokens: int) -> None:
+    if tokens > max_input_tokens:
+        raise ValidationException(
+            "Tool-loop input remains over max_input_tokens after truncation: "
+            + f"{tokens} > {max_input_tokens}"
+        )
 
 
 def _with_iteration_scope(
@@ -305,7 +314,14 @@ async def execute_tool_loop(
         Final HonchoLLMCallResponse with accumulated token counts and tool call
         history, or a StreamingResponseWithMetadata if stream_final=True.
     """
-    from .conversation import count_message_tokens, truncate_messages_to_fit
+    from .conversation import (
+        _is_tool_result_message,  # pyright: ignore[reportPrivateUsage]
+        count_message_tokens,
+        truncate_messages_to_fit,
+    )
+
+    def is_user_query(message: dict[str, Any]) -> bool:
+        return message.get("role") == "user" and not _is_tool_result_message(message)
 
     if not MIN_TOOL_ITERATIONS <= max_tool_iterations <= MAX_TOOL_ITERATIONS:
         raise ValidationException(
@@ -342,11 +358,48 @@ async def execute_tool_loop(
         logger.debug(f"Tool execution iteration {iteration + 1}/{max_tool_iterations}")
 
         if max_input_tokens is not None:
+            user_anchor = next(
+                (
+                    message.copy()
+                    for message in reversed(conversation_messages)
+                    if is_user_query(message)
+                ),
+                None,
+            )
             if count_message_tokens(conversation_messages) > max_input_tokens:
                 hit_input_token_cap = True
             conversation_messages = truncate_messages_to_fit(
                 conversation_messages, max_input_tokens
             )
+
+            added_user_query = False
+            restored_user_anchor = False
+            if not any(is_user_query(message) for message in conversation_messages):
+                conversation_messages.append(
+                    user_anchor
+                    or {
+                        "role": "user",
+                        "content": _CONTINUITY_USER_MESSAGE,
+                    }
+                )
+                added_user_query = True
+                restored_user_anchor = user_anchor is not None
+
+            post_truncation_tokens = count_message_tokens(conversation_messages)
+            if post_truncation_tokens > max_input_tokens and restored_user_anchor:
+                conversation_messages[-1] = {
+                    "role": "user",
+                    "content": _CONTINUITY_USER_MESSAGE,
+                }
+                post_truncation_tokens = count_message_tokens(conversation_messages)
+
+            if post_truncation_tokens > max_input_tokens and added_user_query:
+                conversation_messages = truncate_messages_to_fit(
+                    conversation_messages, max_input_tokens
+                )
+                post_truncation_tokens = count_message_tokens(conversation_messages)
+
+            _raise_if_tool_loop_input_over_cap(post_truncation_tokens, max_input_tokens)
 
         async def _call_with_messages(
             effective_tool_choice: str | dict[str, Any] | None = effective_tool_choice,
@@ -572,6 +625,8 @@ async def execute_tool_loop(
         conversation_messages = truncate_messages_to_fit(
             conversation_messages, max_input_tokens
         )
+        post_truncation_tokens = count_message_tokens(conversation_messages)
+        _raise_if_tool_loop_input_over_cap(post_truncation_tokens, max_input_tokens)
 
     if stream_final:
         # Snapshot the plan the loop settled on — streaming retries pin to
