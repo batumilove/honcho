@@ -18,9 +18,9 @@ def test_truncate_messages_to_fit_keeps_last_unit_when_over_limit() -> None:
     assert truncated == messages
 
 
-def test_truncate_messages_to_fit_preserves_tool_result_pair() -> None:
+def test_truncate_messages_to_fit_preserves_user_query_and_tool_result_pair() -> None:
     messages = [
-        {"role": "user", "content": "old context " * 1000},
+        {"role": "user", "content": "investigate the memory"},
         {
             "role": "assistant",
             "content": None,
@@ -32,12 +32,32 @@ def test_truncate_messages_to_fit_preserves_tool_result_pair() -> None:
                 }
             ],
         },
-        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "old result " * 1000,
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_2", "content": "recent result"},
     ]
+    expected = [messages[0], *messages[3:]]
 
-    truncated = truncate_messages_to_fit(messages, max_tokens=5)
+    truncated = truncate_messages_to_fit(
+        messages,
+        max_tokens=count_message_tokens(expected),
+    )
 
-    assert truncated == messages[1:]
+    assert truncated == expected
 
 
 def test_count_message_tokens_includes_openai_tool_call_arguments() -> None:
@@ -110,7 +130,8 @@ def test_truncate_messages_to_fit_preserves_gemini_tool_pair() -> None:
     parts-based detection, neither message would be recognized as a tool
     unit, and truncation could split or drop them individually."""
     messages: list[dict[str, Any]] = [
-        {"role": "user", "parts": [{"text": "old context " * 1000}]},
+        {"role": "user", "parts": [{"text": "investigate the memory"}]},
+        {"role": "model", "parts": [{"text": "old context " * 1000}]},
         {
             "role": "model",
             "parts": [
@@ -129,9 +150,14 @@ def test_truncate_messages_to_fit_preserves_gemini_tool_pair() -> None:
             ],
         },
     ]
+    expected = [messages[0], *messages[2:]]
 
-    truncated = truncate_messages_to_fit(messages, max_tokens=20)
+    truncated = truncate_messages_to_fit(
+        messages,
+        max_tokens=count_message_tokens(expected),
+    )
 
-    # The oldest (bulk-text) message should be dropped; the function_call +
-    # function_response pair stays intact together.
-    assert truncated == messages[1:]
+    # The old bulk-text unit is dropped while the real user query and complete
+    # function_call/function_response pair remain. The function_response uses
+    # role=user but must not be mistaken for the query itself.
+    assert truncated == expected
