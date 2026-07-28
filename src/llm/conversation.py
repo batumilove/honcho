@@ -10,6 +10,7 @@ import json
 import logging
 from typing import Any, cast
 
+from src.exceptions import ValidationException
 from src.utils.tokens import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,36 @@ def _group_into_units(
     return units
 
 
+def _validate_truncation_result(
+    result: list[dict[str, Any]],
+    *,
+    pre_tokens: int,
+    max_tokens: int,
+    system_tokens: int,
+    retained_units: list[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Log token diagnostics and enforce the truncation hard cap."""
+    post_tokens = count_message_tokens(result)
+    retained_unit_tokens = [count_message_tokens(unit) for unit in retained_units]
+    cap_exceeded = post_tokens > max_tokens
+    logger.log(
+        logging.WARNING if cap_exceeded else logging.INFO,
+        "Truncation diagnostics: pre_tokens=%s post_tokens=%s max_tokens=%s "
+        + "system_tokens=%s retained_unit_tokens=%s cap_hit=true",
+        pre_tokens,
+        post_tokens,
+        max_tokens,
+        system_tokens,
+        retained_unit_tokens,
+    )
+    if cap_exceeded:
+        raise ValidationException(
+            "Conversation remains over max_tokens after truncation: "
+            + f"{post_tokens} > {max_tokens}"
+        )
+    return result
+
+
 def truncate_messages_to_fit(
     messages: list[dict[str, Any]],
     max_tokens: int,
@@ -157,16 +188,27 @@ def truncate_messages_to_fit(
 
     system_tokens = count_message_tokens(system_messages)
     available_tokens = max_tokens - system_tokens
+    units = _group_into_units(conversation)
 
     if available_tokens <= 0:
         logger.warning("System message exceeds max_input_tokens")
-        return messages
-
-    units = _group_into_units(conversation)
+        return _validate_truncation_result(
+            messages,
+            pre_tokens=current_tokens,
+            max_tokens=max_tokens,
+            system_tokens=system_tokens,
+            retained_units=units,
+        )
 
     if not units:
         logger.warning("No valid conversation units")
-        return system_messages
+        return _validate_truncation_result(
+            system_messages,
+            pre_tokens=current_tokens,
+            max_tokens=max_tokens,
+            system_tokens=system_tokens,
+            retained_units=[],
+        )
 
     # Preserve the most recent real user query. Tool loops can otherwise evict
     # their only user message while retaining recent assistant/tool units,
@@ -208,7 +250,13 @@ def truncate_messages_to_fit(
             + f"(~{count_message_tokens(removed_unit)} tokens)"
         )
 
-    result = system_messages + [m for unit in units for m in unit]
+    result = _validate_truncation_result(
+        system_messages + [m for unit in units for m in unit],
+        pre_tokens=current_tokens,
+        max_tokens=max_tokens,
+        system_tokens=system_tokens,
+        retained_units=units,
+    )
     result_tokens = count_message_tokens(result)
     logger.info(
         f"Truncation complete: {current_tokens} → {result_tokens} tokens "
