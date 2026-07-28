@@ -1,5 +1,8 @@
 from typing import Any
 
+import pytest
+
+from src.exceptions import ValidationException
 from src.llm.conversation import (
     _is_tool_result_message,  # pyright: ignore[reportPrivateUsage]
     _is_tool_use_message,  # pyright: ignore[reportPrivateUsage]
@@ -8,14 +11,70 @@ from src.llm.conversation import (
 )
 
 
-def test_truncate_messages_to_fit_keeps_last_unit_when_over_limit() -> None:
+def test_truncate_messages_to_fit_rejects_last_unit_over_limit() -> None:
     messages = [
         {"role": "user", "content": "x " * 2000},
     ]
 
-    truncated = truncate_messages_to_fit(messages, max_tokens=1)
+    with pytest.raises(ValidationException, match="remains over max_tokens"):
+        truncate_messages_to_fit(messages, max_tokens=1)
 
-    assert truncated == messages
+
+def test_truncate_messages_to_fit_rejects_oversized_system_context() -> None:
+    messages = [
+        {"role": "system", "content": "policy " * 2000},
+        {"role": "user", "content": "continue"},
+    ]
+
+    with pytest.raises(ValidationException, match="remains over max_tokens"):
+        truncate_messages_to_fit(messages, max_tokens=1)
+
+
+def test_truncate_messages_to_fit_rejects_oversized_tool_unit() -> None:
+    messages = [
+        {"role": "user", "content": "investigate"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": "large " * 2000,
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "large result " * 2000,
+        },
+    ]
+
+    with pytest.raises(ValidationException, match="remains over max_tokens"):
+        truncate_messages_to_fit(messages, max_tokens=10)
+
+
+def test_truncation_cap_hit_logs_token_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    messages = [{"role": "user", "content": "x " * 2000}]
+
+    with (
+        caplog.at_level("INFO", logger="src.llm.conversation"),
+        pytest.raises(ValidationException),
+    ):
+        truncate_messages_to_fit(messages, max_tokens=1)
+
+    assert "pre_tokens=" in caplog.text
+    assert "post_tokens=" in caplog.text
+    assert "max_tokens=1" in caplog.text
+    assert "system_tokens=" in caplog.text
+    assert "retained_unit_tokens=" in caplog.text
+    assert "cap_hit=true" in caplog.text
 
 
 def test_truncate_messages_to_fit_preserves_user_query_and_tool_result_pair() -> None:

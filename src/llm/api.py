@@ -323,23 +323,34 @@ async def honcho_llm_call(
         # and surface a `hit_input_token_cap` boolean on the response.
         #
         # The signal is purely token-based ("did the input exceed cap?")
-        # rather than message-count-based — the helper deliberately keeps
-        # the last conversation unit even when it's oversized (see
-        # truncate_messages_to_fit), so a single-message over-cap input
-        # (the deriver's prompt-only case) would otherwise silently fly
-        # through with hit=False. Token-based comparison catches it.
+        # rather than message-count-based. Recount the helper result at this
+        # final local boundary so a regression cannot dispatch a known-over-cap
+        # payload to the provider.
         toolless_hit_input_token_cap = False
         toolless_messages = messages
         if max_input_tokens is not None:
             from .conversation import count_message_tokens, truncate_messages_to_fit
 
             base_messages = messages or [{"role": "user", "content": prompt}]
-            toolless_hit_input_token_cap = (
-                count_message_tokens(base_messages) > max_input_tokens
-            )
+            pre_truncation_tokens = count_message_tokens(base_messages)
+            toolless_hit_input_token_cap = pre_truncation_tokens > max_input_tokens
             toolless_messages = truncate_messages_to_fit(
                 base_messages, max_input_tokens
             )
+            post_truncation_tokens = count_message_tokens(toolless_messages)
+            logger.info(
+                "Tool-less truncation diagnostics: pre_tokens=%s post_tokens=%s "
+                + "max_input_tokens=%s cap_hit=%s",
+                pre_truncation_tokens,
+                post_truncation_tokens,
+                max_input_tokens,
+                str(toolless_hit_input_token_cap).lower(),
+            )
+            if post_truncation_tokens > max_input_tokens:
+                raise ValidationException(
+                    "Tool-less input remains over max_input_tokens after truncation: "
+                    + f"{post_truncation_tokens} > {max_input_tokens}"
+                )
 
         # Re-bind the closure to use the truncated message list.
         if toolless_messages is not None:
