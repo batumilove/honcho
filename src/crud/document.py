@@ -32,6 +32,34 @@ from src.vector_store import (
 logger = getLogger(__name__)
 
 
+def _remove_nul_bytes(value: Any) -> tuple[Any, int]:
+    """Recursively remove PostgreSQL-invalid NUL bytes from JSON-like values."""
+    if isinstance(value, str):
+        count = value.count("\x00")
+        return value.replace("\x00", ""), count
+    if isinstance(value, list):
+        cleaned_items: list[Any] = []
+        count = 0
+        for item in cast(list[Any], value):
+            cleaned, item_count = _remove_nul_bytes(item)
+            cleaned_items.append(cleaned)
+            count += item_count
+        return cleaned_items, count
+    if isinstance(value, tuple):
+        cleaned_items, count = _remove_nul_bytes(list(cast(tuple[Any, ...], value)))
+        return tuple(cleaned_items), count
+    if isinstance(value, dict):
+        cleaned_mapping: dict[Any, Any] = {}
+        count = 0
+        for key, item in cast(dict[Any, Any], value).items():
+            cleaned_key, key_count = _remove_nul_bytes(key)
+            cleaned_item, item_count = _remove_nul_bytes(item)
+            cleaned_mapping[cleaned_key] = cleaned_item
+            count += key_count + item_count
+        return cleaned_mapping, count
+    return value, 0
+
+
 def get_all_documents(
     workspace_name: str,
     *,
@@ -451,17 +479,43 @@ async def create_documents(
 
     for doc in documents:
         try:
+            content = doc.content.replace("\x00", "")
+            metadata_dict = doc.metadata.model_dump(exclude_none=True)
+            metadata_dict, metadata_nul_count = _remove_nul_bytes(metadata_dict)
+            source_ids, source_nul_count = _remove_nul_bytes(doc.source_ids)
+            nul_count = doc.content.count("\x00") + metadata_nul_count + source_nul_count
+            if nul_count:
+                logger.warning(
+                    "Removed %d NUL byte(s) from document text fields before persistence",
+                    nul_count,
+                )
+            if not content:
+                logger.warning(
+                    "Dropped document whose content became empty after NUL removal"
+                )
+                continue
+
+            sanitized_doc = doc.model_copy(
+                update={
+                    "content": content,
+                    "metadata": schemas.DocumentMetadata.model_validate(metadata_dict),
+                    "source_ids": source_ids,
+                }
+            )
+
             # for each document, if deduplicate is True, perform a process
             # that checks against existing documents and either rejects this document
             # as a duplicate OR deletes an existing document that is a duplicate.
             if deduplicate:
                 is_duplicate = await is_rejected_duplicate(
-                    db, doc, workspace_name, observer=observer, observed=observed
+                    db,
+                    sanitized_doc,
+                    workspace_name,
+                    observer=observer,
+                    observed=observed,
                 )
                 if is_duplicate:
                     continue
-
-            metadata_dict = doc.metadata.model_dump(exclude_none=True)
 
             # Determine if we need to persist embeddings to postgres
             # True when: TYPE=pgvector OR still migrating (dual-write to both stores)
@@ -470,42 +524,42 @@ async def create_documents(
                 or not settings.VECTOR_STORE.MIGRATED
             )
 
-            if store_embeddings_in_postgres and doc.embedding:
+            if store_embeddings_in_postgres and sanitized_doc.embedding:
                 new_doc = models.Document(
                     workspace_name=workspace_name,
                     observer=observer,
                     observed=observed,
-                    content=doc.content,
-                    level=doc.level,
-                    times_derived=doc.times_derived,
+                    content=sanitized_doc.content,
+                    level=sanitized_doc.level,
+                    times_derived=sanitized_doc.times_derived,
                     internal_metadata=metadata_dict,
-                    session_name=doc.session_name,
-                    embedding=doc.embedding,
+                    session_name=sanitized_doc.session_name,
+                    embedding=sanitized_doc.embedding,
                     # Tree linkage column
-                    source_ids=doc.source_ids,
+                    source_ids=sanitized_doc.source_ids,
                 )
             else:
                 new_doc = models.Document(
                     workspace_name=workspace_name,
                     observer=observer,
                     observed=observed,
-                    content=doc.content,
-                    level=doc.level,
-                    times_derived=doc.times_derived,
+                    content=sanitized_doc.content,
+                    level=sanitized_doc.level,
+                    times_derived=sanitized_doc.times_derived,
                     internal_metadata=metadata_dict,
-                    session_name=doc.session_name,
+                    session_name=sanitized_doc.session_name,
                     # Tree linkage column
-                    source_ids=doc.source_ids,
+                    source_ids=sanitized_doc.source_ids,
                 )
 
-            if doc.embedding:
+            if sanitized_doc.embedding:
                 new_doc.sync_state = "pending"
             honcho_documents.append(new_doc)
-            accepted_documents.append(doc)
+            accepted_documents.append(sanitized_doc)
 
             # Track embedding for vector store (ID will be available after commit)
-            if doc.embedding:
-                docs_with_embeddings.append((new_doc, doc.embedding))
+            if sanitized_doc.embedding:
+                docs_with_embeddings.append((new_doc, sanitized_doc.embedding))
 
         except Exception as e:
             logger.error(

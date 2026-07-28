@@ -33,13 +33,19 @@ def _observation_text(obs: ExplicitObservation | DeductiveObservation) -> str:
     return obs.conclusion if isinstance(obs, DeductiveObservation) else obs.content
 
 
+def _remove_nul(text: str) -> str:
+    """Remove PostgreSQL-invalid NUL bytes from model-generated text."""
+    return text.replace("\x00", "")
+
+
 def _normalized_observation(
     obs: ExplicitObservation | DeductiveObservation,
 ) -> ExplicitObservation | DeductiveObservation:
     """Return an observation with its persisted/embed text normalized."""
-    text = _observation_text(obs).strip()
+    text = _remove_nul(_observation_text(obs)).strip()
     if isinstance(obs, DeductiveObservation):
-        return obs.model_copy(update={"conclusion": text})
+        premises = [_remove_nul(premise) for premise in obs.premises]
+        return obs.model_copy(update={"conclusion": text, "premises": premises})
     return obs.model_copy(update={"content": text})
 
 
@@ -84,10 +90,22 @@ class RepresentationManager:
             logger.debug("No observations to save")
             return new_documents
 
+        observations = representation.deductive + representation.explicit
+        nul_count = sum(_observation_text(obs).count("\x00") for obs in observations)
+        nul_count += sum(
+            premise.count("\x00")
+            for obs in representation.deductive
+            for premise in obs.premises
+        )
+        if nul_count:
+            logger.warning(
+                "Removed %d NUL byte(s) from generated representation",
+                nul_count,
+            )
+
+        normalized_observations = [_normalized_observation(obs) for obs in observations]
         all_observations = [
-            _normalized_observation(obs)
-            for obs in representation.deductive + representation.explicit
-            if _observation_text(obs).strip()
+            obs for obs in normalized_observations if _observation_text(obs).strip()
         ]
         if not all_observations:
             logger.debug("No non-empty observations to save")
