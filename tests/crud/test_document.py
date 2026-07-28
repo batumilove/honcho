@@ -1,7 +1,9 @@
 import datetime
+from unittest.mock import AsyncMock
 
 import pytest
 from nanoid import generate as generate_nanoid
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -490,3 +492,56 @@ class TestDocumentCRUD:
         )
         assert result.scalars().all() == []
         assert "Dropped document whose content became empty after NUL removal" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_create_observations_removes_nul_before_embedding_and_persistence(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        test_workspace, test_peer = sample_data
+        test_peer2, test_session, _ = await self._setup_test_data(
+            db_session, test_workspace, test_peer
+        )
+        embed = AsyncMock(return_value=[[0.1] * 1536])
+        monkeypatch.setattr(
+            "src.crud.document.embedding_client.simple_batch_embed", embed
+        )
+
+        accepted = await crud.create_observations(
+            db_session,
+            observations=[
+                schemas.ConclusionCreate(
+                    content="User\x00 prefers dark mode",
+                    observer_id=test_peer.name,
+                    observed_id=test_peer2.name,
+                    session_id=test_session.name,
+                )
+            ],
+            workspace_name=test_workspace.name,
+        )
+
+        embed.assert_awaited_once_with(["User prefers dark mode"])
+        assert len(accepted) == 1
+        assert accepted[0].content == "User prefers dark mode"
+        persisted = await db_session.get(models.Document, accepted[0].id)
+        assert persisted is not None
+        assert persisted.content == "User prefers dark mode"
+
+    def test_conclusion_create_rejects_content_emptied_by_nul_removal(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        embed = AsyncMock()
+        monkeypatch.setattr(
+            "src.crud.document.embedding_client.simple_batch_embed", embed
+        )
+
+        with pytest.raises(ValidationError, match="at least 1 character"):
+            schemas.ConclusionCreate(
+                content="\x00\x00",
+                observer_id="observer",
+                observed_id="observed",
+            )
+        embed.assert_not_awaited()

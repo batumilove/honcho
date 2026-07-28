@@ -489,10 +489,10 @@ class ConclusionCreate(BaseModel):
 
     _token_count: int = PrivateAttr(default=0)
 
-    @field_validator("content", mode="after")
+    @field_validator("content", mode="before")
     @classmethod
-    def sanitize_content(cls, v: str) -> str:
-        return v.replace("\x00", "")
+    def sanitize_content(cls, v: Any) -> Any:
+        return v.replace("\x00", "") if isinstance(v, str) else v
 
     @model_validator(mode="after")
     def validate_token_count(self) -> Self:
