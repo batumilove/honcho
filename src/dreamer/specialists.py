@@ -10,6 +10,7 @@ Each specialist is a fully autonomous agent that:
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from abc import ABC, abstractmethod
@@ -19,8 +20,6 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from nanoid import generate as generate_nanoid
-
-from src import crud, schemas
 from src.config import ConfiguredModelSettings, settings
 from src.dependencies import tracked_db
 from src.exceptions import ValidationException
@@ -36,6 +35,9 @@ from src.utils.agent_tools import (
     INDUCTION_SPECIALIST_TOOLS,
     create_tool_executor,
 )
+from src.utils.tokens import estimate_tokens
+
+from src import crud, schemas
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +249,13 @@ If you update it, send the full deduplicated list and remove stale entries.
             )
 
             model_config = self.get_model_config()
+            tools = self.get_tools(peer_card_enabled=peer_card_enabled)
+            # ``max_input_tokens`` caps conversation messages only. Reserve the
+            # separately supplied tool schemas here; the safety margin remains
+            # available for provider tokenizer and chat-template differences.
+            tool_definition_tokens = estimate_tokens(
+                json.dumps(tools, sort_keys=True, separators=(",", ":"))
+            )
 
             # Respect operator-configured max_output_tokens on the specialist's
             # ModelConfig (e.g. DREAM_DEDUCTION_MODEL_CONFIG__MAX_OUTPUT_TOKENS).
@@ -262,11 +271,12 @@ If you update it, send the full deduplicated list and remove stale entries.
                 settings.DREAM.CONTEXT_WINDOW_TOKENS
                 - effective_max_tokens
                 - settings.DREAM.CONTEXT_SAFETY_MARGIN_TOKENS
+                - tool_definition_tokens
             )
             if context_limited_input_tokens <= 0:
                 raise ValidationException(
-                    "Dream context window must exceed max output tokens plus "
-                    + "the context safety margin"
+                    "Dream context window must exceed max output tokens, tool "
+                    + "definitions, and the context safety margin"
                 )
             effective_max_input_tokens = min(
                 settings.DREAM.MAX_INPUT_TOKENS,
@@ -282,7 +292,7 @@ If you update it, send the full deduplicated list and remove stale entries.
                 model_config=model_config,
                 prompt="",  # Ignored since we pass messages
                 max_tokens=effective_max_tokens,
-                tools=self.get_tools(peer_card_enabled=peer_card_enabled),
+                tools=tools,
                 tool_choice=None,
                 tool_executor=tool_executor,
                 max_tool_iterations=self.get_max_iterations(),
