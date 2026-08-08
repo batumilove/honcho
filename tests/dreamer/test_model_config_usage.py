@@ -1,10 +1,11 @@
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
 from src.config import settings
 from src.dreamer.specialists import DeductionSpecialist, InductionSpecialist
 from src.llm import HonchoLLMCallResponse
+from src.utils.tokens import estimate_tokens
 
 
 def test_deduction_prompt_uses_identity_markers_framing() -> None:
@@ -108,14 +109,73 @@ async def test_deduction_specialist_uses_nested_model_config(
     expected_output_tokens = (
         expected_config.max_output_tokens or specialist.get_max_tokens()
     )
+    tools = specialist.get_tools(peer_card_enabled=True)
+    tool_definition_tokens = estimate_tokens(
+        json.dumps(tools, sort_keys=True, separators=(",", ":"))
+    )
     expected_input_tokens = min(
         settings.DREAM.MAX_INPUT_TOKENS,
         settings.DREAM.CONTEXT_WINDOW_TOKENS
         - expected_output_tokens
-        - settings.DREAM.CONTEXT_SAFETY_MARGIN_TOKENS,
+        - settings.DREAM.CONTEXT_SAFETY_MARGIN_TOKENS
+        - tool_definition_tokens,
     )
 
     assert result.content == "done"
     assert kwargs["model_config"] == expected_config
     assert kwargs["max_input_tokens"] == expected_input_tokens
     assert "llm_settings" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_induction_specialist_reserves_tool_definitions_from_input_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings.METRICS, "ENABLED", False)
+    specialist = InductionSpecialist()
+    mock_response = HonchoLLMCallResponse(
+        content="done",
+        input_tokens=10,
+        output_tokens=5,
+        finish_reasons=["stop"],
+    )
+
+    with (
+        patch("src.dreamer.specialists.crud.get_peer", new=AsyncMock()),
+        patch(
+            "src.dreamer.specialists.create_tool_executor",
+            new=AsyncMock(return_value=AsyncMock()),
+        ),
+        patch(
+            "src.dreamer.specialists.honcho_llm_call",
+            new=AsyncMock(return_value=mock_response),
+        ) as mock_llm_call,
+    ):
+        await specialist.run(
+            workspace_name="workspace",
+            observer="alice",
+            observed="alice",
+            session_name="session",
+        )
+
+    await_args = mock_llm_call.await_args
+    if await_args is None:
+        raise AssertionError("Expected dreamer LLM call")
+    kwargs = await_args.kwargs
+    tools = specialist.get_tools()
+    tool_definition_tokens = estimate_tokens(
+        json.dumps(tools, sort_keys=True, separators=(",", ":"))
+    )
+    configured_output_tokens = settings.DREAM.INDUCTION_MODEL_CONFIG.max_output_tokens
+    expected_output_tokens = configured_output_tokens or specialist.get_max_tokens()
+    expected_input_tokens = min(
+        settings.DREAM.MAX_INPUT_TOKENS,
+        settings.DREAM.CONTEXT_WINDOW_TOKENS
+        - expected_output_tokens
+        - settings.DREAM.CONTEXT_SAFETY_MARGIN_TOKENS
+        - tool_definition_tokens,
+    )
+
+    assert tool_definition_tokens > 0
+    assert kwargs["tools"] == tools
+    assert kwargs["max_input_tokens"] == expected_input_tokens
