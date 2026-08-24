@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -239,6 +240,46 @@ async def test_openai_simple_batch_embed_forwards_dimensions(
     assert len(fake.calls) == 1
     assert fake.calls[0]["dimensions"] == 768
     assert fake.calls[0]["input"] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_openai_simple_batch_embed_retries_transient_provider_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class FlakyEmbeddingsAPI:
+        async def create(self, **_kwargs: Any) -> SimpleNamespace:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise ConnectionError("embedding endpoint unavailable")
+            return SimpleNamespace(data=[SimpleNamespace(embedding=[0.1] * 8)])
+
+    class FakeOpenAIClient:
+        def __init__(self, *, api_key: str | None, base_url: str | None) -> None:
+            self.embeddings = FlakyEmbeddingsAPI()
+
+    sleep = AsyncMock()
+    monkeypatch.setattr("src.embedding_client.AsyncOpenAI", FakeOpenAIClient)
+    monkeypatch.setattr("src.embedding_client.asyncio.sleep", sleep)
+    client = _EmbeddingClient(
+        EmbeddingModelConfig(
+            transport="openai",
+            model="text-embedding-3-small",
+            api_key="test-key",
+        ),
+        vector_dimensions=8,
+        max_input_tokens=8192,
+        max_tokens_per_request=300_000,
+        send_dimensions=False,
+    )
+
+    result = await client.simple_batch_embed(["hello"])
+
+    assert result == [[0.1] * 8]
+    assert attempts == 3
+    assert [call.args[0] for call in sleep.await_args_list] == [1, 2]
 
 
 @pytest.mark.asyncio

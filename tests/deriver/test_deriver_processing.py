@@ -7,9 +7,15 @@ import pytest
 
 from src import models
 from src.config import settings
+from src.crud.representation import RepresentationManager
 from src.deriver.deriver import process_representation_tasks_batch
+from src.exceptions import RepresentationSaveError
 from src.llm import HonchoLLMCallResponse
-from src.utils.representation import PromptRepresentation, Representation
+from src.utils.representation import (
+    ExplicitObservationBase,
+    PromptRepresentation,
+    Representation,
+)
 from src.utils.work_unit import construct_work_unit_key, parse_work_unit_key
 
 
@@ -65,6 +71,103 @@ class TestDeriverProcessing:
         )
         assert kwargs["model_config"].stop_sequences == expected_config.stop_sequences
         assert "llm_settings" not in kwargs
+
+    async def test_all_observer_save_failures_are_explicit(self) -> None:
+        message = Mock(
+            id=1,
+            public_id="msg_1",
+            session_name="session-1",
+            workspace_name="workspace-1",
+            peer_name="alice",
+            content="hello",
+            token_count=5,
+            created_at=datetime.now(timezone.utc),
+        )
+        configuration = Mock()
+        configuration.reasoning.enabled = True
+        configuration.reasoning.custom_instructions = None
+        response = HonchoLLMCallResponse(
+            content=PromptRepresentation(
+                explicit=[ExplicitObservationBase(content="Alice has a dog")]
+            ),
+            input_tokens=10,
+            output_tokens=5,
+            finish_reasons=["STOP"],
+        )
+        save = AsyncMock(side_effect=RuntimeError("embedding retries exhausted"))
+        emitted: list[Any] = []
+
+        with (
+            patch(
+                "src.deriver.deriver.honcho_llm_call",
+                new_callable=AsyncMock,
+                return_value=response,
+            ),
+            patch.object(RepresentationManager, "save_representation", save),
+            patch("src.deriver.deriver.emit", side_effect=emitted.append),
+            pytest.raises(
+                RepresentationSaveError, match="failed for all 1 observer"
+            ),
+        ):
+            await process_representation_tasks_batch(
+                messages=[message],
+                message_level_configuration=configuration,
+                observers=["bob"],
+                observed="alice",
+                queue_item_message_ids=[1],
+            )
+
+        assert save.await_count == 1
+        assert emitted[-1].observer_count == 0
+        assert emitted[-1].failed_observer_count == 1
+
+    async def test_partial_observer_failure_is_recorded(self) -> None:
+        message = Mock(
+            id=1,
+            public_id="msg_1",
+            session_name="session-1",
+            workspace_name="workspace-1",
+            peer_name="alice",
+            content="hello",
+            token_count=5,
+            created_at=datetime.now(timezone.utc),
+        )
+        configuration = Mock()
+        configuration.reasoning.enabled = True
+        configuration.reasoning.custom_instructions = None
+        response = HonchoLLMCallResponse(
+            content=PromptRepresentation(
+                explicit=[ExplicitObservationBase(content="Alice has a dog")]
+            ),
+            input_tokens=10,
+            output_tokens=5,
+            finish_reasons=["STOP"],
+        )
+        save = AsyncMock(
+            side_effect=[None, RuntimeError("embedding retries exhausted")]
+        )
+        emitted: list[Any] = []
+
+        with (
+            patch(
+                "src.deriver.deriver.honcho_llm_call",
+                new_callable=AsyncMock,
+                return_value=response,
+            ),
+            patch.object(RepresentationManager, "save_representation", save),
+            patch("src.deriver.deriver.emit", side_effect=emitted.append),
+        ):
+            await process_representation_tasks_batch(
+                messages=[message],
+                message_level_configuration=configuration,
+                observers=["bob", "carol"],
+                observed="alice",
+                queue_item_message_ids=[1],
+            )
+
+        assert save.await_count == 2
+        assert emitted[-1].observer_count == 1
+        assert emitted[-1].failed_observer_count == 1
 
     async def test_process_representation_tasks_batch_passes_custom_instructions_into_prompt(
         self,
