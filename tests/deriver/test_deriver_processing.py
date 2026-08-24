@@ -105,9 +105,7 @@ class TestDeriverProcessing:
             ),
             patch.object(RepresentationManager, "save_representation", save),
             patch("src.deriver.deriver.emit", side_effect=emitted.append),
-            pytest.raises(
-                RepresentationSaveError, match="failed for all 1 observer"
-            ),
+            pytest.raises(RepresentationSaveError, match="failed for all 1 observer"),
         ):
             await process_representation_tasks_batch(
                 messages=[message],

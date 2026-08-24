@@ -258,7 +258,7 @@ async def test_openai_simple_batch_embed_retries_transient_provider_failure(
 
     class FakeOpenAIClient:
         def __init__(self, *, api_key: str | None, base_url: str | None) -> None:
-            self.embeddings = FlakyEmbeddingsAPI()
+            self.embeddings: FlakyEmbeddingsAPI = FlakyEmbeddingsAPI()
 
     sleep = AsyncMock()
     monkeypatch.setattr("src.embedding_client.AsyncOpenAI", FakeOpenAIClient)
