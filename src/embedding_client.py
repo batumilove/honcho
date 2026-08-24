@@ -262,7 +262,8 @@ class _EmbeddingClient:
             token_count = len(self.encoding.encode(text))
             if token_count > self.max_embedding_tokens:
                 raise ValueError(
-                    f"Text at index {idx} exceeds maximum token limit of {self.max_embedding_tokens} tokens (got {token_count} tokens)"
+                    f"Text at index {idx} exceeds maximum token limit of "
+                    + f"{self.max_embedding_tokens} tokens (got {token_count} tokens)"
                 )
             token_counts.append(token_count)
 
@@ -397,12 +398,14 @@ class _EmbeddingClient:
                     contents=[item.text for item in batch],
                     config={"output_dimensionality": self.vector_dimensions},
                 )
-                if response.embeddings:
-                    for item, embedding in zip(batch, response.embeddings, strict=True):
-                        if embedding.values:
-                            result[item.text_id][item.chunk_index] = (
-                                self._validate_embedding_dimensions(embedding.values)
-                            )
+                if not response.embeddings:
+                    raise ValueError("No embeddings returned from Gemini API")
+                for item, embedding in zip(batch, response.embeddings, strict=True):
+                    if not embedding.values:
+                        raise ValueError("No embedding values returned from Gemini API")
+                    result[item.text_id][item.chunk_index] = (
+                        self._validate_embedding_dimensions(embedding.values)
+                    )
             else:  # openai
                 openai_kwargs: dict[str, Any] = {
                     "model": self.model,

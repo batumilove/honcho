@@ -283,6 +283,48 @@ async def test_openai_simple_batch_embed_retries_transient_provider_failure(
 
 
 @pytest.mark.asyncio
+async def test_gemini_simple_batch_embed_retries_empty_provider_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class FlakyGeminiModels:
+        async def embed_content(self, **_kwargs: Any) -> SimpleNamespace:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                return SimpleNamespace(embeddings=[])
+            return SimpleNamespace(
+                embeddings=[SimpleNamespace(values=[0.2] * 8)],
+            )
+
+    class FakeGeminiClient:
+        def __init__(self, *, api_key: str | None, http_options: Any) -> None:
+            self.aio: Any = SimpleNamespace(models=FlakyGeminiModels())
+
+    sleep = AsyncMock()
+    monkeypatch.setattr("src.embedding_client.genai.Client", FakeGeminiClient)
+    monkeypatch.setattr("src.embedding_client.asyncio.sleep", sleep)
+    client = _EmbeddingClient(
+        EmbeddingModelConfig(
+            transport="gemini",
+            model="gemini-embedding-001",
+            api_key="test-key",
+        ),
+        vector_dimensions=8,
+        max_input_tokens=2048,
+        max_tokens_per_request=300_000,
+        send_dimensions=False,
+    )
+
+    result = await client.simple_batch_embed(["hello"])
+
+    assert result == [[0.2] * 8]
+    assert attempts == 3
+    assert [call.args[0] for call in sleep.await_args_list] == [1, 2]
+
+
+@pytest.mark.asyncio
 async def test_openai_batch_embed_forwards_dimensions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
