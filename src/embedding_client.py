@@ -249,77 +249,33 @@ class _EmbeddingClient:
         )
 
     async def simple_batch_embed(self, texts: list[str]) -> list[list[float]]:
+        """Batch-embed texts through the token-aware, bounded-retry pipeline.
+
+        Each input must fit within ``max_embedding_tokens``; oversized inputs
+        are rejected rather than sub-chunked so one vector is returned per text.
         """
-        Simple batch embedding for a list of text strings.
+        if not texts:
+            return []
 
-        Args:
-            texts: List of text strings to embed
-
-        Returns:
-            List of embedding vectors corresponding to input texts
-
-        Raises:
-            ValueError: If any text exceeds token limits
-        """
-        embeddings: list[list[float]] = []
-
-        for i in range(0, len(texts), self.max_batch_size):
-            batch = texts[i : i + self.max_batch_size]
-
-            async def _embed_batch(batch: list[str] = batch) -> list[list[float]]:
-                """One provider call for one batch. Lifted into a closure so
-                _emit_embedding_call can time + emit + propagate errors."""
-                batch_embeddings: list[list[float]] = []
-                if isinstance(self.client, genai.Client):
-                    # Type cast needed due to genai type signature complexity
-                    response = await self.client.aio.models.embed_content(
-                        model=self.model,
-                        contents=batch,  # pyright: ignore[reportArgumentType]
-                        config={"output_dimensionality": self.vector_dimensions},
-                    )
-                    if response.embeddings:
-                        for emb in response.embeddings:
-                            if emb.values:
-                                batch_embeddings.append(
-                                    self._validate_embedding_dimensions(emb.values)
-                                )
-                else:  # openai
-                    openai_kwargs: dict[str, Any] = {
-                        "input": batch,
-                        "model": self.model,
-                    }
-                    if self.send_dimensions:
-                        openai_kwargs["dimensions"] = self.vector_dimensions
-                    response = await self.client.embeddings.create(**openai_kwargs)
-                    batch_embeddings.extend(
-                        [
-                            self._validate_embedding_dimensions(data.embedding)
-                            for data in response.data
-                        ]
-                    )
-                return batch_embeddings
-
-            try:
-                # Pre-compute the tiktoken estimate ONCE for telemetry; the
-                # batch contents don't change between attempts.
-                tokens_estimate = sum(len(self.encoding.encode(t)) for t in batch)
-                batch_embeddings = await _emit_embedding_call(
-                    provider=self.transport,
-                    model=self.model,
-                    texts=batch,
-                    input_tokens_estimate=tokens_estimate,
-                    fn=_embed_batch,
+        token_counts: list[int] = []
+        for idx, text in enumerate(texts):
+            token_count = len(self.encoding.encode(text))
+            if token_count > self.max_embedding_tokens:
+                raise ValueError(
+                    f"Text at index {idx} exceeds maximum token limit of "
+                    + f"{self.max_embedding_tokens} tokens (got {token_count} tokens)"
                 )
-                embeddings.extend(batch_embeddings)
-            except Exception as e:
-                # Check if it's a token limit error and re-raise as ValueError for consistency
-                if "token" in str(e).lower():
-                    raise ValueError(
-                        f"Text content exceeds maximum token limit of {self.max_embedding_tokens}."
-                    ) from e
-                raise
+            token_counts.append(token_count)
 
-        return embeddings
+        text_chunks: dict[str, list[tuple[str, int]]] = {
+            str(i): [(text, token_counts[i])] for i, text in enumerate(texts)
+        }
+        batches = self._create_batches(text_chunks)
+        batch_results = await asyncio.gather(
+            *[self._process_batch(batch) for batch in batches]
+        )
+        combined = self._accumulate_embeddings(batch_results)
+        return [combined[str(i)][0] for i in range(len(texts))]
 
     async def batch_embed(
         self, id_resource_dict: dict[str, str]
@@ -442,12 +398,14 @@ class _EmbeddingClient:
                     contents=[item.text for item in batch],
                     config={"output_dimensionality": self.vector_dimensions},
                 )
-                if response.embeddings:
-                    for item, embedding in zip(batch, response.embeddings, strict=True):
-                        if embedding.values:
-                            result[item.text_id][item.chunk_index] = (
-                                self._validate_embedding_dimensions(embedding.values)
-                            )
+                if not response.embeddings:
+                    raise ValueError("No embeddings returned from Gemini API")
+                for item, embedding in zip(batch, response.embeddings, strict=True):
+                    if not embedding.values:
+                        raise ValueError("No embedding values returned from Gemini API")
+                    result[item.text_id][item.chunk_index] = (
+                        self._validate_embedding_dimensions(embedding.values)
+                    )
             else:  # openai
                 openai_kwargs: dict[str, Any] = {
                     "model": self.model,
