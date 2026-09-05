@@ -492,7 +492,11 @@ class ConclusionCreate(BaseModel):
     @field_validator("content", mode="before")
     @classmethod
     def sanitize_content(cls, v: Any) -> Any:
-        return v.replace("\x00", "") if isinstance(v, str) else v
+        if isinstance(v, str):
+            return v.replace("\x00", "")
+        if isinstance(v, (bytes, bytearray)):
+            return v.replace(b"\x00", b"")
+        return v
 
     @model_validator(mode="after")
     def validate_token_count(self) -> Self:
