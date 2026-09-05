@@ -1,4 +1,5 @@
 import datetime
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -529,9 +530,32 @@ class TestDocumentCRUD:
         assert persisted is not None
         assert persisted.content == "User prefers dark mode"
 
+    @pytest.mark.parametrize(
+        "content",
+        [b"User\x00 prefers dark mode", bytearray(b"User\x00 prefers dark mode")],
+        ids=["bytes", "bytearray"],
+    )
+    def test_conclusion_create_sanitizes_nul_in_byte_inputs(
+        self,
+        content: Any,
+    ):
+        conclusion = schemas.ConclusionCreate(
+            content=content,
+            observer_id="observer",
+            observed_id="observed",
+        )
+
+        assert conclusion.content == "User prefers dark mode"
+
+    @pytest.mark.parametrize(
+        "content",
+        ["\x00\x00", b"\x00\x00", bytearray(b"\x00\x00")],
+        ids=["str", "bytes", "bytearray"],
+    )
     def test_conclusion_create_rejects_content_emptied_by_nul_removal(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        content: Any,
     ):
         embed = AsyncMock()
         monkeypatch.setattr(
@@ -540,7 +564,7 @@ class TestDocumentCRUD:
 
         with pytest.raises(ValidationError, match="at least 1 character"):
             schemas.ConclusionCreate(
-                content="\x00\x00",
+                content=content,
                 observer_id="observer",
                 observed_id="observed",
             )
