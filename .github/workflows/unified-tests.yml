@@ -14,6 +14,8 @@ permissions:
 jobs:
   start-runner:
     name: Start Fly Runner
+    # Enable only after configuring the required Fly/AWS secrets and targets.
+    if: vars.FLY_UNIFIED_TESTS_ENABLED == 'true'
     uses: ./.github/workflows/start-fly-runner.yml
     secrets: inherit
 
