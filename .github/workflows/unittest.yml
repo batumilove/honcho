@@ -147,9 +147,26 @@ jobs:
     if: always()
     steps:
       - name: Check test results
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          PYTHON_CHANGED: ${{ needs.changes.outputs.python }}
+          PYTHON_RESULT: ${{ needs.test-python.result }}
         run: |
-          if [[ "${{ needs.changes.outputs.python }}" == "true" && "${{ needs.test-python.result }}" != "success" && "${{ needs.test-python.result }}" != "skipped" ]]; then
-            echo "Python tests failed or were cancelled"
+          set -euo pipefail
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "Change detection failed or was cancelled"
+            exit 1
+          fi
+          if [[ "$PYTHON_CHANGED" != "true" && "$PYTHON_CHANGED" != "false" ]]; then
+            echo "Change detection returned an invalid Python result"
+            exit 1
+          fi
+          if [[ "$PYTHON_CHANGED" == "true" && "$PYTHON_RESULT" != "success" ]]; then
+            echo "Python tests failed, were cancelled, or were skipped"
+            exit 1
+          fi
+          if [[ "$PYTHON_CHANGED" == "false" && "$PYTHON_RESULT" != "skipped" ]]; then
+            echo "Python tests ran unexpectedly"
             exit 1
           fi
           echo "All required tests passed!"

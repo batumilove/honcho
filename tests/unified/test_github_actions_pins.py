@@ -1,4 +1,5 @@
 import re
+import subprocess
 from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
@@ -208,45 +209,156 @@ def test_checkout_steps_do_not_persist_credentials() -> None:
 
 def test_action_policy_runs_for_every_workflow_change() -> None:
     workflow = _load_workflow(WORKFLOWS_DIR / "unittest.yml")
+    assert isinstance(workflow, MappingNode)
     workflow_scope = ".github/workflows/**"
-    trigger_scope_count = Counter(_iter_scalar_values(workflow))[workflow_scope]
-    filter_blocks = [
-        filters
-        for mapping in _iter_mapping_nodes(workflow)
-        if isinstance((filters := _mapping_child(mapping, "filters")), ScalarNode)
-    ]
 
-    assert trigger_scope_count == 2, (
-        "FastAPI push and pull-request scopes must include every workflow file"
-    )
-    assert len(filter_blocks) == 1
+    triggers = _mapping_child(workflow, "on")
+    assert isinstance(triggers, MappingNode)
+    for trigger_name in ("push", "pull_request"):
+        trigger = _mapping_child(triggers, trigger_name)
+        assert isinstance(trigger, MappingNode)
+        paths = _mapping_child(trigger, "paths")
+        assert isinstance(paths, SequenceNode)
+        assert workflow_scope in list(_iter_scalar_values(paths)), (
+            f"FastAPI {trigger_name} scope must include every workflow file"
+        )
+
+    jobs = _mapping_child(workflow, "jobs")
+    assert isinstance(jobs, MappingNode)
+    changes = _mapping_child(jobs, "changes")
+    assert isinstance(changes, MappingNode)
+    steps = _mapping_child(changes, "steps")
+    assert isinstance(steps, SequenceNode)
+    filter_steps = [
+        step
+        for step in steps.value
+        if isinstance(step, MappingNode)
+        and isinstance((uses := _mapping_child(step, "uses")), ScalarNode)
+        and uses.value.startswith("dorny/paths-filter@")
+    ]
+    assert len(filter_steps) == 1
+    with_node = _mapping_child(filter_steps[0], "with")
+    assert isinstance(with_node, MappingNode)
+    filters = _mapping_child(with_node, "filters")
+    assert isinstance(filters, ScalarNode)
     filter_workflow = cast(
         Node | None,
         yaml.compose(  # pyright: ignore[reportUnknownMemberType]
-            filter_blocks[0].value
+            filters.value
         ),
     )
-    assert filter_workflow is not None
-    filter_scope_count = Counter(_iter_scalar_values(filter_workflow))[workflow_scope]
-    assert filter_scope_count == 1, (
+    assert isinstance(filter_workflow, MappingNode)
+    python_filter = _mapping_child(filter_workflow, "python")
+    assert isinstance(python_filter, SequenceNode)
+    assert workflow_scope in list(_iter_scalar_values(python_filter)), (
         "FastAPI Python filter must include every workflow file"
     )
 
 
-def test_fly_deploy_shell_does_not_interpolate_github_values() -> None:
-    unsafe_expressions = (
-        "${{ github.event.inputs.version }}",
-        "${{ github.ref_name }}",
+@pytest.mark.parametrize(
+    ("changes_result", "python_changed", "python_result", "expected_returncode"),
+    [
+        ("failure", "false", "skipped", 1),
+        ("success", "true", "skipped", 1),
+        ("success", "true", "success", 0),
+        ("success", "false", "skipped", 0),
+        ("success", "false", "success", 1),
+        ("success", "", "skipped", 1),
+    ],
+)
+def test_status_fails_closed(
+    changes_result: str,
+    python_changed: str,
+    python_result: str,
+    expected_returncode: int,
+) -> None:
+    workflow = _load_workflow(WORKFLOWS_DIR / "unittest.yml")
+    assert isinstance(workflow, MappingNode)
+    jobs = _mapping_child(workflow, "jobs")
+    assert isinstance(jobs, MappingNode)
+    test_status = _mapping_child(jobs, "test-status")
+    assert isinstance(test_status, MappingNode)
+    steps = _mapping_child(test_status, "steps")
+    assert isinstance(steps, SequenceNode) and len(steps.value) == 1
+    step = steps.value[0]
+    assert isinstance(step, MappingNode)
+    run = _mapping_child(step, "run")
+    env = _mapping_child(step, "env")
+    assert isinstance(run, ScalarNode)
+    assert isinstance(env, MappingNode)
+
+    expected_env = {
+        "CHANGES_RESULT": "${{ needs.changes.result }}",
+        "PYTHON_CHANGED": "${{ needs.changes.outputs.python }}",
+        "PYTHON_RESULT": "${{ needs.test-python.result }}",
+    }
+    for name, expected_value in expected_env.items():
+        value = _mapping_child(env, name)
+        assert isinstance(value, ScalarNode) and value.value == expected_value
+    assert "${{" not in run.value
+
+    completed = subprocess.run(
+        ["bash", "-c", run.value],
+        check=False,
+        capture_output=True,
+        env={
+            "CHANGES_RESULT": changes_result,
+            "PYTHON_CHANGED": python_changed,
+            "PYTHON_RESULT": python_result,
+        },
+        text=True,
     )
+    assert completed.returncode == expected_returncode, completed.stdout
+
+
+def test_fly_deploy_shell_does_not_interpolate_github_values() -> None:
+    unsafe_expression = re.compile(
+        r"\$\{\{[^}\n]*(?:\bversion\b|ref_name)[^}\n]*}}"
+    )
+    expected_env = {
+        "GITHUB_EVENT_NAME": "${{ github.event_name }}",
+        "GITHUB_REF_NAME": "${{ github.ref_name }}",
+        "INPUT_VERSION": "${{ github.event.inputs.version }}",
+    }
 
     for workflow_name in FLY_DEPLOY_WORKFLOWS:
         workflow_path = WORKFLOWS_DIR / workflow_name
+        relevant_steps = 0
+        image_name = (
+            "honcho-prod-image" if workflow_name == "fly-deploy-prod.yml" else "honcho-image"
+        )
+
         for mapping in _iter_mapping_nodes(_load_workflow(workflow_path)):
             run = _mapping_child(mapping, "run")
             if not isinstance(run, ScalarNode):
                 continue
-            for expression in unsafe_expressions:
-                assert expression not in run.value, (
-                    f"GitHub value interpolated directly into shell in "
-                    f"{workflow_path}: {expression}"
+            assert unsafe_expression.search(run.value) is None, (
+                f"GitHub value interpolated directly into shell in {workflow_path}"
+            )
+            if "flyctl deploy" not in run.value and "curl --fail" not in run.value:
+                continue
+
+            relevant_steps += 1
+            env = _mapping_child(mapping, "env")
+            assert isinstance(env, MappingNode)
+            for name, expected_value in expected_env.items():
+                value = _mapping_child(env, name)
+                assert isinstance(value, ScalarNode) and value.value == expected_value
+
+            assert 'if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]' in run.value
+            if "flyctl deploy" in run.value:
+                assert 'IMAGE_LABEL="deployment-${INPUT_VERSION}"' in run.value
+                assert 'IMAGE_LABEL="deployment-${GITHUB_REF_NAME}"' in run.value
+            else:
+                assert 'TAG="$INPUT_VERSION"' in run.value
+                assert 'TAG="${GITHUB_REF_NAME#v}"' in run.value
+                assert (
+                    f'IMAGE_LABEL="{image_name}:deployment-' + '${INPUT_VERSION}"'
+                    in run.value
                 )
+                assert (
+                    f'IMAGE_LABEL="{image_name}:deployment-' + '${GITHUB_REF_NAME}"'
+                    in run.value
+                )
+
+        assert relevant_steps == 2
