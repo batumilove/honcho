@@ -1,9 +1,9 @@
 import re
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
 
 import yaml
+from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS_DIR = PROJECT_ROOT / ".github" / "workflows"
@@ -32,15 +32,19 @@ APPROVED_ACTION_REFS = {
 }
 
 
-def _iter_uses(value: Any) -> Iterator[str]:
-    """Yield every GitHub Actions `uses` value from parsed workflow YAML."""
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if key == "uses" and isinstance(child, str):
-                yield child
+def _iter_uses(node: Node) -> Iterator[str]:
+    """Yield every GitHub Actions `uses` value from a parsed YAML node tree."""
+    if isinstance(node, MappingNode):
+        for key, child in node.value:
+            if (
+                isinstance(key, ScalarNode)
+                and key.value == "uses"
+                and isinstance(child, ScalarNode)
+            ):
+                yield child.value
             yield from _iter_uses(child)
-    elif isinstance(value, list):
-        for child in value:
+    elif isinstance(node, SequenceNode):
+        for child in node.value:
             yield from _iter_uses(child)
 
 
@@ -48,7 +52,8 @@ def test_external_actions_use_approved_immutable_refs() -> None:
     observed_actions: set[str] = set()
 
     for workflow_path in sorted(WORKFLOWS_DIR.glob("*.y*ml")):
-        workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8")) or {}
+        workflow = yaml.compose(workflow_path.read_text(encoding="utf-8"))
+        assert workflow is not None, f"empty workflow: {workflow_path}"
         for uses in _iter_uses(workflow):
             if uses.startswith("./"):
                 continue
