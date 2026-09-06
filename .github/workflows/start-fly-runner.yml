@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Generate unique runner labels
         id: generate-labels
@@ -46,7 +46,7 @@ jobs:
           echo "labels=$UNIQUE_LABELS" >> "$GITHUB_OUTPUT"
 
       - name: Setup Fly CLI
-        uses: superfly/flyctl-actions/setup-flyctl@master
+        uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # Node.js 24 commit
 
       - name: Get Fly app info
         id: get-app-info
