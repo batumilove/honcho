@@ -66,6 +66,19 @@ def _iter_mapping_nodes(node: Node) -> Iterator[MappingNode]:
             yield from _iter_mapping_nodes(child)
 
 
+def _iter_scalar_values(node: Node) -> Iterator[str]:
+    """Yield every scalar value from a parsed YAML node tree."""
+    if isinstance(node, ScalarNode):
+        yield node.value
+    elif isinstance(node, MappingNode):
+        for key, child in node.value:
+            yield from _iter_scalar_values(key)
+            yield from _iter_scalar_values(child)
+    elif isinstance(node, SequenceNode):
+        for child in node.value:
+            yield from _iter_scalar_values(child)
+
+
 def _mapping_child(node: MappingNode, name: str) -> Node | None:
     """Return a mapping value by scalar key name."""
     for key, child in node.value:
@@ -191,6 +204,33 @@ def test_checkout_steps_do_not_persist_credentials() -> None:
             ), f"checkout credentials must not persist in {workflow_path}"
 
     assert checkout_steps == APPROVED_ACTION_COUNTS["actions/checkout"]
+
+
+def test_action_policy_runs_for_every_workflow_change() -> None:
+    workflow = _load_workflow(WORKFLOWS_DIR / "unittest.yml")
+    workflow_scope = ".github/workflows/**"
+    trigger_scope_count = Counter(_iter_scalar_values(workflow))[workflow_scope]
+    filter_blocks = [
+        filters
+        for mapping in _iter_mapping_nodes(workflow)
+        if isinstance((filters := _mapping_child(mapping, "filters")), ScalarNode)
+    ]
+
+    assert trigger_scope_count == 2, (
+        "FastAPI push and pull-request scopes must include every workflow file"
+    )
+    assert len(filter_blocks) == 1
+    filter_workflow = cast(
+        Node | None,
+        yaml.compose(  # pyright: ignore[reportUnknownMemberType]
+            filter_blocks[0].value
+        ),
+    )
+    assert filter_workflow is not None
+    filter_scope_count = Counter(_iter_scalar_values(filter_workflow))[workflow_scope]
+    assert filter_scope_count == 1, (
+        "FastAPI Python filter must include every workflow file"
+    )
 
 
 def test_fly_deploy_shell_does_not_interpolate_github_values() -> None:
