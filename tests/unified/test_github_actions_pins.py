@@ -1,6 +1,7 @@
 import re
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import yaml
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
@@ -52,7 +53,12 @@ def test_external_actions_use_approved_immutable_refs() -> None:
     observed_actions: set[str] = set()
 
     for workflow_path in sorted(WORKFLOWS_DIR.glob("*.y*ml")):
-        workflow = yaml.compose(workflow_path.read_text(encoding="utf-8"))
+        workflow = cast(
+            Node | None,
+            yaml.compose(  # pyright: ignore[reportUnknownMemberType]
+                workflow_path.read_text(encoding="utf-8")
+            ),
+        )
         assert workflow is not None, f"empty workflow: {workflow_path}"
         for uses in _iter_uses(workflow):
             if uses.startswith("./"):
