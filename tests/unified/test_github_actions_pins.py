@@ -3,6 +3,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
 
+import pytest
 import yaml
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
@@ -47,6 +48,28 @@ def _iter_uses(node: Node) -> Iterator[str]:
     elif isinstance(node, SequenceNode):
         for child in node.value:
             yield from _iter_uses(child)
+
+
+@pytest.mark.parametrize(
+    "workflow_text",
+    [
+        "steps:\n  - uses:\n      nested: value\n",
+        "steps:\n  - uses:\n      - action\n",
+        "steps:\n  - uses:\n",
+        "steps:\n  - uses: 123\n",
+    ],
+)
+def test_non_string_uses_is_rejected(workflow_text: str) -> None:
+    workflow = cast(
+        Node | None,
+        yaml.compose(  # pyright: ignore[reportUnknownMemberType]
+            workflow_text
+        ),
+    )
+    assert workflow is not None
+
+    with pytest.raises(AssertionError, match="uses value must be a string"):
+        list(_iter_uses(workflow))
 
 
 def test_external_actions_use_approved_immutable_refs() -> None:
