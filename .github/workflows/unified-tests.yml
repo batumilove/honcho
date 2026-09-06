@@ -37,6 +37,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ github.sha }}
 
       - name: Configure AWS credentials
@@ -112,7 +113,7 @@ jobs:
             exit 0
           fi
 
-          RUNNER_ID="" 
+          RUNNER_ID=""
           if [ -n "$RUNNER_NAME" ]; then
             RUNNER_ID=$(echo "$RUNNERS_RESPONSE" | jq -r --arg name "$RUNNER_NAME" '.runners[]? | select(.name == $name) | .id')
           fi

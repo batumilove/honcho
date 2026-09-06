@@ -51,6 +51,38 @@ APPROVED_ACTION_COUNTS = {
     "superfly/flyctl-actions/setup-flyctl": 4,
 }
 APPROVED_LOCAL_USES = "./.github/workflows/start-fly-runner.yml"
+FLY_DEPLOY_WORKFLOWS = ("fly-deploy.yml", "fly-deploy-prod.yml")
+
+
+def _iter_mapping_nodes(node: Node) -> Iterator[MappingNode]:
+    """Yield every mapping from a parsed YAML node tree."""
+    if isinstance(node, MappingNode):
+        yield node
+        for key, child in node.value:
+            yield from _iter_mapping_nodes(key)
+            yield from _iter_mapping_nodes(child)
+    elif isinstance(node, SequenceNode):
+        for child in node.value:
+            yield from _iter_mapping_nodes(child)
+
+
+def _mapping_child(node: MappingNode, name: str) -> Node | None:
+    """Return a mapping value by scalar key name."""
+    for key, child in node.value:
+        if isinstance(key, ScalarNode) and key.value == name:
+            return child
+    return None
+
+
+def _load_workflow(path: Path) -> Node:
+    workflow = cast(
+        Node | None,
+        yaml.compose(  # pyright: ignore[reportUnknownMemberType]
+            path.read_text(encoding="utf-8")
+        ),
+    )
+    assert workflow is not None, f"empty workflow: {path}"
+    return workflow
 
 
 def _iter_uses(node: Node) -> Iterator[str]:
@@ -125,3 +157,56 @@ def test_external_actions_use_approved_immutable_refs() -> None:
     assert set(APPROVED_ACTION_COUNTS) == set(APPROVED_ACTION_REFS)
     assert observed_actions == Counter(APPROVED_ACTION_COUNTS)
     assert observed_local_uses == Counter({APPROVED_LOCAL_USES: 1})
+
+
+def test_workflows_do_not_contain_non_breaking_spaces() -> None:
+    for workflow_path in sorted(WORKFLOWS_DIR.glob("*.y*ml")):
+        assert "\N{NO-BREAK SPACE}" not in workflow_path.read_text(encoding="utf-8"), (
+            f"non-breaking space in {workflow_path}"
+        )
+
+
+def test_checkout_steps_do_not_persist_credentials() -> None:
+    checkout_steps = 0
+
+    for workflow_path in sorted(WORKFLOWS_DIR.glob("*.y*ml")):
+        for mapping in _iter_mapping_nodes(_load_workflow(workflow_path)):
+            uses = _mapping_child(mapping, "uses")
+            if not (
+                isinstance(uses, ScalarNode)
+                and uses.value.startswith("actions/checkout@")
+            ):
+                continue
+
+            checkout_steps += 1
+            with_node = _mapping_child(mapping, "with")
+            assert isinstance(with_node, MappingNode), (
+                f"checkout step must define with.persist-credentials in {workflow_path}"
+            )
+            persist_credentials = _mapping_child(with_node, "persist-credentials")
+            assert (
+                isinstance(persist_credentials, ScalarNode)
+                and persist_credentials.tag == "tag:yaml.org,2002:bool"
+                and persist_credentials.value == "false"
+            ), f"checkout credentials must not persist in {workflow_path}"
+
+    assert checkout_steps == APPROVED_ACTION_COUNTS["actions/checkout"]
+
+
+def test_fly_deploy_shell_does_not_interpolate_github_values() -> None:
+    unsafe_expressions = (
+        "${{ github.event.inputs.version }}",
+        "${{ github.ref_name }}",
+    )
+
+    for workflow_name in FLY_DEPLOY_WORKFLOWS:
+        workflow_path = WORKFLOWS_DIR / workflow_name
+        for mapping in _iter_mapping_nodes(_load_workflow(workflow_path)):
+            run = _mapping_child(mapping, "run")
+            if not isinstance(run, ScalarNode):
+                continue
+            for expression in unsafe_expressions:
+                assert expression not in run.value, (
+                    f"GitHub value interpolated directly into shell in "
+                    f"{workflow_path}: {expression}"
+                )
