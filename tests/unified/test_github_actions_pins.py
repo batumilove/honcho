@@ -1,4 +1,5 @@
 import re
+from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
@@ -34,15 +35,33 @@ APPROVED_ACTION_REFS = {
 }
 
 
+APPROVED_ACTION_COUNTS = {
+    "actions/attest-build-provenance": 1,
+    "actions/checkout": 8,
+    "actions/setup-python": 2,
+    "astral-sh/setup-uv": 2,
+    "aws-actions/aws-secretsmanager-get-secrets": 1,
+    "aws-actions/configure-aws-credentials": 1,
+    "docker/build-push-action": 1,
+    "docker/login-action": 1,
+    "docker/metadata-action": 1,
+    "docker/setup-buildx-action": 1,
+    "dorny/paths-filter": 1,
+    "oven-sh/setup-bun": 1,
+    "superfly/flyctl-actions/setup-flyctl": 4,
+}
+APPROVED_LOCAL_USES = "./.github/workflows/start-fly-runner.yml"
+
+
 def _iter_uses(node: Node) -> Iterator[str]:
     """Yield every GitHub Actions `uses` value from a parsed YAML node tree."""
     if isinstance(node, MappingNode):
         for key, child in node.value:
-            if (
-                isinstance(key, ScalarNode)
-                and key.value == "uses"
-                and isinstance(child, ScalarNode)
-            ):
+            if isinstance(key, ScalarNode) and key.value == "uses":
+                assert (
+                    isinstance(child, ScalarNode)
+                    and child.tag == "tag:yaml.org,2002:str"
+                ), "uses value must be a string"
                 yield child.value
             yield from _iter_uses(child)
     elif isinstance(node, SequenceNode):
@@ -73,7 +92,8 @@ def test_non_string_uses_is_rejected(workflow_text: str) -> None:
 
 
 def test_external_actions_use_approved_immutable_refs() -> None:
-    observed_actions: set[str] = set()
+    observed_actions: Counter[str] = Counter()
+    observed_local_uses: Counter[str] = Counter()
 
     for workflow_path in sorted(WORKFLOWS_DIR.glob("*.y*ml")):
         workflow = cast(
@@ -85,6 +105,7 @@ def test_external_actions_use_approved_immutable_refs() -> None:
         assert workflow is not None, f"empty workflow: {workflow_path}"
         for uses in _iter_uses(workflow):
             if uses.startswith("./"):
+                observed_local_uses[uses] += 1
                 continue
 
             action, separator, ref = uses.partition("@")
@@ -99,6 +120,8 @@ def test_external_actions_use_approved_immutable_refs() -> None:
             assert ref == APPROVED_ACTION_REFS[action], (
                 f"unexpected ref for {action} in {workflow_path}: {ref}"
             )
-            observed_actions.add(action)
+            observed_actions[action] += 1
 
-    assert observed_actions == set(APPROVED_ACTION_REFS)
+    assert set(APPROVED_ACTION_COUNTS) == set(APPROVED_ACTION_REFS)
+    assert observed_actions == Counter(APPROVED_ACTION_COUNTS)
+    assert observed_local_uses == Counter({APPROVED_LOCAL_USES: 1})
