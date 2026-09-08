@@ -5,14 +5,18 @@ Private helpers are intentionally imported from the workflow policy suite.
 """
 # pyright: reportPrivateUsage=none, reportImplicitRelativeImport=none
 
+import importlib.util
 import json
 import os
 import shlex
 import stat
 import subprocess
+import tempfile
 import threading
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Protocol, cast
 
 import pytest
 import yaml
@@ -29,6 +33,10 @@ SECRET_NAMES = (
     ("fly-deploy-prod.yml", "PROD_ENV_WEBHOOK_SECRET", "PROD_ENV_URL"),
 )
 ENCODER_SCRIPT = Path(".github") / "scripts" / "fly_webhook_payload.py"
+
+
+class CurlConfigQuote(Protocol):
+    def __call__(self, value: str, *, name: str) -> str: ...
 
 
 def _step_by_name(workflow_name: str, step_name: str) -> yaml.MappingNode:
@@ -109,7 +117,7 @@ def test_webhook_secrets_reach_curl_without_command_interpolation(
     encoder = _step_by_name(workflow_name, "Encode webhook JSON")
     encoder_env = _mapping_child(encoder, "env")
     assert isinstance(encoder_env, yaml.MappingNode)
-    for name, value in {
+    expected_env = {
         "GITHUB_EVENT_NAME": "${{ github.event_name }}",
         "GITHUB_REF_NAME": "${{ github.ref_name }}",
         "INPUT_VERSION": "${{ github.event.inputs.version }}",
@@ -120,9 +128,14 @@ def test_webhook_secrets_reach_curl_without_command_interpolation(
         ),
         "WEBHOOK_SECRET": f"${{{{ secrets.{secret_name} }}}}",
         "WEBHOOK_URL": f"${{{{ secrets.{url_name} }}}}",
-    }.items():
-        node = _mapping_child(encoder_env, name)
-        assert isinstance(node, yaml.ScalarNode) and node.value == value, name
+    }
+    actual_env = {}
+    for key, value in encoder_env.value:
+        assert isinstance(key, yaml.ScalarNode)
+        assert isinstance(value, yaml.ScalarNode)
+        assert key.value not in actual_env
+        actual_env[key.value] = value.value
+    assert actual_env == expected_env
 
 
 @pytest.mark.parametrize(("workflow_name", "secret_name", "url_name"), SECRET_NAMES)
@@ -169,6 +182,7 @@ def test_encoder_step_binds_every_env_name_the_script_reads() -> None:
         steps = [
             step for step in steps_node.value if isinstance(step, yaml.MappingNode)
         ]
+        assert len(steps) == 3, f"{workflow_name}: unexpected prompt-service step"
         encoder_indices: list[int] = []
         for index, step in enumerate(steps):
             name = _mapping_child(step, "name")
@@ -188,6 +202,9 @@ def test_encoder_step_binds_every_env_name_the_script_reads() -> None:
         assert isinstance(checkout_with, yaml.MappingNode)
         persist = _mapping_child(checkout_with, "persist-credentials")
         assert isinstance(persist, yaml.ScalarNode) and persist.value == "false"
+        send_name = _mapping_child(steps[2], "name")
+        assert isinstance(send_name, yaml.ScalarNode)
+        assert send_name.value == "Send POST request"
 
 
 def test_encoder_produces_exact_private_files_and_curl_sends_exact_bytes(
@@ -274,10 +291,72 @@ def test_encoder_produces_exact_private_files_and_curl_sends_exact_bytes(
     }
 
 
+def test_private_writer_is_private_before_atomic_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = importlib.util.spec_from_file_location("fly_webhook_payload", ENCODER_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    writer = cast(Callable[[Path, str], None], module._write_private_atomic)
+
+    original_mkstemp = tempfile.mkstemp
+    original_replace = os.replace
+    events: list[str] = []
+
+    def checked_mkstemp(*, prefix: str, dir: Path) -> tuple[int, str]:
+        fd, name = original_mkstemp(prefix=prefix, dir=dir)
+        assert stat.S_IMODE(os.fstat(fd).st_mode) == 0o600
+        events.append("private-created")
+        return fd, name
+
+    def checked_replace(source: str | Path, destination: str | Path) -> None:
+        assert events == ["private-created"]
+        assert stat.S_IMODE(Path(source).stat().st_mode) == 0o600
+        events.append("atomic-replace")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(tempfile, "mkstemp", checked_mkstemp)
+    monkeypatch.setattr(os, "replace", checked_replace)
+    target = tmp_path / "sealed"
+    writer(target, "secret")
+    assert events == ["private-created", "atomic-replace"]
+    assert target.read_text() == "secret"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_encoder_escapes_url_quotes_and_backslashes(tmp_path: Path) -> None:
+    env = {
+        **os.environ,
+        "GITHUB_EVENT_NAME": "push",
+        "GITHUB_REF_NAME": "v1",
+        "INPUT_VERSION": "ignored",
+        "IMAGE_LABEL_PREFIX": "img:deployment-",
+        "WEBHOOK_SECRET": "secret",
+        "WEBHOOK_URL": 'https://hook.example/base"\\tail',
+    }
+    completed = subprocess.run(
+        ["python3", str(ENCODER_SCRIPT.resolve())],
+        capture_output=True,
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert (tmp_path / "curl-config").read_bytes() == (
+        b'header = "Content-Type: application/json"\n'
+        b'header = "Authorization: Bearer secret"\n'
+        b'url = "https://hook.example/base\\"\\\\tail/webhooks/v1/add_honcho_version"\n'
+    )
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     (
         ("WEBHOOK_SECRET", "secret\nheader = injected"),
+        ("WEBHOOK_SECRET", "secret\rheader = injected"),
+        ("WEBHOOK_URL", "https://host\nurl = injected"),
         ("WEBHOOK_URL", "https://host\rurl = injected"),
     ),
 )
@@ -305,6 +384,17 @@ def test_encoder_rejects_config_line_injection(
     assert completed.returncode != 0
     assert not (tmp_path / "payload.json").exists()
     assert not (tmp_path / "curl-config").exists()
+
+
+@pytest.mark.parametrize("name", ("WEBHOOK_SECRET", "WEBHOOK_URL"))
+def test_encoder_rejects_nul_config_injection(name: str) -> None:
+    spec = importlib.util.spec_from_file_location("fly_webhook_payload", ENCODER_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    quote = cast(CurlConfigQuote, module._curl_config_quote)
+    with pytest.raises(ValueError, match="CR, LF, or NUL"):
+        quote("value\0directive", name=name)
 
 
 def test_encoder_script_has_no_hardcoded_secrets() -> None:
