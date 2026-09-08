@@ -38,7 +38,7 @@ APPROVED_ACTION_REFS = {
 
 APPROVED_ACTION_COUNTS = {
     "actions/attest-build-provenance": 1,
-    "actions/checkout": 8,
+    "actions/checkout": 10,
     "actions/setup-python": 2,
     "astral-sh/setup-uv": 2,
     "aws-actions/aws-secretsmanager-get-secrets": 1,

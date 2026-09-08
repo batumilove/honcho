@@ -46,18 +46,21 @@ jobs:
     needs: deploy-honcho-image
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Encode webhook JSON
         env:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
+          IMAGE_LABEL_PREFIX: "honcho-image:deployment-"
           WEBHOOK_SECRET: ${{ secrets.TEST_ENV_WEBHOOK_SECRET }}
           WEBHOOK_URL: ${{ secrets.TEST_ENV_URL }}
         run: |
           python3 .github/scripts/fly_webhook_payload.py
           chmod 600 payload.json curl-config
-
       - name: Send POST request
         run: |
           # Secrets live in the mode-600 curl config file, never in argv.
-          curl --fail --silent --show-error -K curl-config --data-binary @payload.json -o /dev/null -w '%{http_code}\n'
+          curl --fail --silent --show-error -K curl-config --data-binary @payload.json -o /dev/null -w '%{http_code}'

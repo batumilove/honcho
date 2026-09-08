@@ -5,7 +5,6 @@ Private helpers are intentionally imported from the workflow policy suite.
 """
 # pyright: reportPrivateUsage=none, reportImplicitRelativeImport=none
 
-import json
 import subprocess
 from pathlib import Path
 
@@ -126,6 +125,38 @@ def test_secret_values_do_not_appear_in_workflow_text(
             )
 
 
+def test_encoder_step_binds_every_env_name_the_script_reads() -> None:
+    """Fail closed if the script starts reading an env name the workflow omits."""
+    import re as _re
+
+    script = ENCODER_SCRIPT.read_text(encoding="utf-8")
+    read_names = set(_re.findall(r'os\.environ\["([A-Z_]+)"\]', script))
+    assert "GITHUB_EVENT_NAME" in read_names
+    for workflow_name in FLY_DEPLOY_WORKFLOWS:
+        encoder = _step_by_name(workflow_name, "Encode webhook JSON")
+        env = _mapping_child(encoder, "env")
+        assert isinstance(env, yaml.MappingNode)
+        bound = {
+            k.value
+            for k, _ in env.value
+            if isinstance(k, yaml.ScalarNode)
+        }
+        missing = read_names - bound
+        assert not missing, f"{workflow_name}: script reads unbound env {missing}"
+        # Checkout must precede the encoder step so the script exists at runtime.
+        doc = _load_workflow(WORKFLOWS_DIR / workflow_name)
+        steps = [
+            node
+            for node in _iter_mapping_nodes(doc)
+            if any(
+                isinstance((u := _mapping_child(node, "uses")), yaml.ScalarNode)
+                and u.value.startswith("actions/checkout@")
+                for _ in [0]
+            )
+        ]
+        assert steps, f"{workflow_name}: prompt-service job must check out the repo"
+
+
 def test_encoder_produces_valid_json_and_argv_free_curl_config() -> None:
     """Run the real encoder with hostile inputs; verify outputs byte-exactly."""
     workdir = WORKFLOWS_DIR.parent.parent
@@ -147,11 +178,22 @@ def test_encoder_produces_valid_json_and_argv_free_curl_config() -> None:
     )
     assert completed.returncode == 0, completed.stderr
     try:
-        payload = json.loads((workdir / "payload.json").read_text())
-        assert payload == {
-            "version": '1.2."3',
-            "image_label": 'img:deployment-"v1.2."3',
-        }
+        payload_text = (workdir / "payload.json").read_text()
+        dq = chr(34)
+        bs = chr(92)
+        expected_payload = (
+            '{"version": "1.2.'
+            + bs
+            + dq
+            + '3", "image_label": "img:deployment-'
+            + bs
+            + dq
+            + 'v1.2.'
+            + bs
+            + dq
+            + '3"}'
+        )
+        assert payload_text == expected_payload, payload_text
         config = (workdir / "curl-config").read_text()
         assert config == (
             'header = "Content-Type: application/json"\n'
