@@ -13,7 +13,7 @@ on:
       - 'uv.lock'
       - 'sdks/typescript/package.json'
       - 'sdks/typescript/bun.lock'
-      - '.github/workflows/unittest.yml'
+      - '.github/workflows/**'
   pull_request:
     branches: [main]
     paths:
@@ -26,7 +26,7 @@ on:
       - 'uv.lock'
       - 'sdks/typescript/package.json'
       - 'sdks/typescript/bun.lock'
-      - '.github/workflows/unittest.yml'
+      - '.github/workflows/**'
 
 permissions:
   contents: read
@@ -39,8 +39,10 @@ jobs:
     outputs:
       python: ${{ steps.filter.outputs.python }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           filters: |
@@ -50,7 +52,7 @@ jobs:
               - 'uv.lock'
               - 'migrations/**'
               - 'sdks/typescript/**'
-              - '.github/workflows/unittest.yml'
+              - '.github/workflows/**'
 
   test-python:
     needs: changes
@@ -74,21 +76,24 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v2
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
+          prune-cache: true
 
       - name: "Set up Python"
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version-file: "pyproject.toml"
 
       - name: Install bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
       - name: Install TypeScript SDK dependencies
         run: bun install
@@ -142,9 +147,26 @@ jobs:
     if: always()
     steps:
       - name: Check test results
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          PYTHON_CHANGED: ${{ needs.changes.outputs.python }}
+          PYTHON_RESULT: ${{ needs.test-python.result }}
         run: |
-          if [[ "${{ needs.changes.outputs.python }}" == "true" && "${{ needs.test-python.result }}" != "success" && "${{ needs.test-python.result }}" != "skipped" ]]; then
-            echo "Python tests failed or were cancelled"
+          set -euo pipefail
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "Change detection failed or was cancelled"
+            exit 1
+          fi
+          if [[ "$PYTHON_CHANGED" != "true" && "$PYTHON_CHANGED" != "false" ]]; then
+            echo "Change detection returned an invalid Python result"
+            exit 1
+          fi
+          if [[ "$PYTHON_CHANGED" == "true" && "$PYTHON_RESULT" != "success" ]]; then
+            echo "Python tests failed, were cancelled, or were skipped"
+            exit 1
+          fi
+          if [[ "$PYTHON_CHANGED" == "false" && "$PYTHON_RESULT" != "skipped" ]]; then
+            echo "Python tests ran unexpectedly"
             exit 1
           fi
           echo "All required tests passed!"
