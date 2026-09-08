@@ -1,11 +1,12 @@
 """
-Fly webhook payloads must be JSON-encoded and keep secrets out of argv.
+Fly webhook payloads must be JSON-encoded and secrets must never reach argv.
 
 Private helpers are intentionally imported from the workflow policy suite.
 """
 # pyright: reportPrivateUsage=none, reportImplicitRelativeImport=none
 
-import re
+import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,9 @@ from test_github_actions_pins import (
 SECRET_NAMES = (
     ("fly-deploy.yml", "TEST_ENV_WEBHOOK_SECRET", "TEST_ENV_URL"),
     ("fly-deploy-prod.yml", "PROD_ENV_WEBHOOK_SECRET", "PROD_ENV_URL"),
+)
+ENCODER_SCRIPT = (
+    Path(".github") / "scripts" / "fly_webhook_payload.py"
 )
 
 
@@ -55,49 +59,38 @@ def _webhook_run(path: Path) -> tuple[str, yaml.MappingNode]:
 def test_webhook_json_is_encoded_not_shell_interpolated(workflow_name: str) -> None:
     run, _ = _webhook_run(WORKFLOWS_DIR / workflow_name)
 
-    # The curl step must consume the pre-encoded file, not build JSON inline.
-    assert '"--json-raw"' not in run and "-d" not in run, (
+    # The curl step must post the pre-encoded file, not build JSON inline.
+    import re as _re
+
+    assert not _re.search(r"(?:^|\s)-d(?:\s|$)", run), (
         f"webhook body must not be assembled inline in {workflow_name}"
     )
-    assert "--json-file" in run, f"webhook must post encoded JSON in {workflow_name}"
-
-    # A dedicated step must encode the JSON with python (jq is not installed).
-    steps = None
-    for node in _iter_mapping_nodes(_load_workflow(WORKFLOWS_DIR / workflow_name)):
-        candidate = _mapping_child(node, "steps")
-        if isinstance(candidate, yaml.SequenceNode):
-            steps = candidate
-    assert steps is not None
-    encoders = [
-        step
-        for step in steps.value
-        if isinstance(step, yaml.MappingNode)
-        and isinstance((name := _mapping_child(step, "name")), yaml.ScalarNode)
-        and name.value == "Encode webhook JSON"
-    ]
-    assert len(encoders) == 1, (
-        f"exactly one Encode webhook JSON step in {workflow_name}"
+    assert "--data-binary @payload.json" in run, (
+        f"webhook must post encoded payload.json in {workflow_name}"
     )
-    encoder_run = _mapping_child(encoders[0], "run")
-    assert isinstance(encoder_run, yaml.ScalarNode)
-    assert "python3 -c" in encoder_run.value and "json.dumps" in encoder_run.value
-    assert "payload.json" in encoder_run.value
+
+    # A dedicated step must encode the payload via the checked-in encoder script.
+    encoder = _step_by_name(workflow_name, "Encode webhook JSON")
+    run_node = _mapping_child(encoder, "run")
+    assert isinstance(run_node, yaml.ScalarNode)
+    assert str(ENCODER_SCRIPT) in run_node.value, (
+        f"encoder step must run {ENCODER_SCRIPT} in {workflow_name}"
+    )
+    assert ENCODER_SCRIPT.is_file(), f"missing encoder script {ENCODER_SCRIPT}"
+    script = ENCODER_SCRIPT.read_text(encoding="utf-8")
+    assert "json.dump" in script, "encoder must use the json module"
 
 
-@pytest.mark.parametrize(("workflow_name", "secret_name", "url_name"), SECRET_NAMES)
+@pytest.mark.parametrize(
+    ("workflow_name", "secret_name", "url_name"), SECRET_NAMES
+)
 def test_webhook_secrets_reach_curl_without_command_interpolation(
     workflow_name: str, secret_name: str, url_name: str
 ) -> None:
     _, mapping = _webhook_run(WORKFLOWS_DIR / workflow_name)
     env = _mapping_child(mapping, "env")
-    assert isinstance(env, yaml.MappingNode)
-    expected = {
-        "WEBHOOK_SECRET": f"${{{{ secrets.{secret_name} }}}}",
-        "WEBHOOK_URL": f"${{{{ secrets.{url_name} }}}}",
-    }
-    for name, value in expected.items():
-        node = _mapping_child(env, name)
-        assert isinstance(node, yaml.ScalarNode) and node.value == value, name
+    # The curl step itself must have no env at all: secrets stay in curl-config.
+    assert env is None, f"curl step must not carry env in {workflow_name}"
 
     encoder = _step_by_name(workflow_name, "Encode webhook JSON")
     encoder_env = _mapping_child(encoder, "env")
@@ -106,23 +99,91 @@ def test_webhook_secrets_reach_curl_without_command_interpolation(
         "GITHUB_EVENT_NAME": "${{ github.event_name }}",
         "GITHUB_REF_NAME": "${{ github.ref_name }}",
         "INPUT_VERSION": "${{ github.event.inputs.version }}",
+        "WEBHOOK_SECRET": f"${{{{ secrets.{secret_name} }}}}",
+        "WEBHOOK_URL": f"${{{{ secrets.{url_name} }}}}",
     }.items():
         node = _mapping_child(encoder_env, name)
         assert isinstance(node, yaml.ScalarNode) and node.value == value, name
 
 
-@pytest.mark.parametrize(("workflow_name", "secret_name", "url_name"), SECRET_NAMES)
+@pytest.mark.parametrize(
+    ("workflow_name", "secret_name", "url_name"), SECRET_NAMES
+)
 def test_secret_values_do_not_appear_in_workflow_text(
     workflow_name: str, secret_name: str, url_name: str
 ) -> None:
     text = (WORKFLOWS_DIR / workflow_name).read_text(encoding="utf-8")
     # Secrets may only be referenced through env bindings, never inline.
-    inline = re.findall(rf"secrets\.({secret_name}|{url_name})", text)
-    assert len(inline) == 2, f"{workflow_name}: secrets must be referenced only in env"
+    inline = text.split("env:")[-1]
+    assert f"secrets.{secret_name}" in inline, workflow_name
+    assert f"secrets.{url_name}" in inline, workflow_name
+    # No secret expression may appear inside any run block.
+    for mapping in _iter_mapping_nodes(_load_workflow(WORKFLOWS_DIR / workflow_name)):
+        run = _mapping_child(mapping, "run")
+        if isinstance(run, yaml.ScalarNode):
+            assert "secrets." not in run.value, (
+                f"secret expression leaked into run block in {workflow_name}"
+            )
 
 
-def test_webhook_payload_matches_expected_schema() -> None:
-    """The encoded payload carries exactly version and image_label keys."""
-    for workflow_name in FLY_DEPLOY_WORKFLOWS:
-        text = (WORKFLOWS_DIR / workflow_name).read_text(encoding="utf-8")
-        assert '"version"' in text and '"image_label"' in text, workflow_name
+def test_encoder_produces_valid_json_and_argv_free_curl_config() -> None:
+    """Run the real encoder with hostile inputs; verify outputs byte-exactly."""
+    workdir = WORKFLOWS_DIR.parent.parent
+    hostile_env = {
+        "GITHUB_EVENT_NAME": "push",
+        "GITHUB_REF_NAME": 'v1.2."3',
+        "INPUT_VERSION": "ignored",
+        "IMAGE_LABEL_PREFIX": 'img:deployment-"',
+        "WEBHOOK_SECRET": 's3cr et"x',
+        "WEBHOOK_URL": "https://hook.example",
+    }
+    completed = subprocess.run(
+        ["python3", str(ENCODER_SCRIPT)],
+        capture_output=True,
+        cwd=workdir,
+        env=hostile_env,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    try:
+        payload = json.loads((workdir / "payload.json").read_text())
+        assert payload == {
+            "version": '1.2."3',
+            "image_label": 'img:deployment-"v1.2."3',
+        }
+        config = (workdir / "curl-config").read_text()
+        assert config == (
+            'header = "Content-Type: application/json"\n'
+            'header = "Authorization: Bearer s3cr et\'x"\n'
+            'url = "https://hook.example/webhooks/v1/add_honcho_version"\n'
+        )
+        # curl itself must parse the config without complaint (DNS failure is fine).
+        curl = subprocess.run(
+            [
+                "curl",
+                "--fail",
+                "-sS",
+                "-K",
+                str(workdir / "curl-config"),
+                "--data-binary",
+                f"@{workdir / 'payload.json'}",
+                "-o",
+                "/dev/null",
+                "--max-time",
+                "2",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert curl.returncode in (0, 6, 7, 28), curl.stderr
+    finally:
+        for name in ("payload.json", "curl-config"):
+            (workdir / name).unlink(missing_ok=True)
+
+
+def test_encoder_script_has_no_hardcoded_secrets() -> None:
+    script = ENCODER_SCRIPT.read_text(encoding="utf-8")
+    for forbidden in ("flyctl", "FLY_API_TOKEN"):
+        assert forbidden not in script, forbidden

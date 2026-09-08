@@ -51,24 +51,13 @@ jobs:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
-        run: |
-          # Determine version and image label based on trigger type
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            TAG="$INPUT_VERSION"
-            IMAGE_LABEL="honcho-image:deployment-${INPUT_VERSION}"
-          else
-            TAG="${GITHUB_REF_NAME#v}"
-            IMAGE_LABEL="honcho-image:deployment-${GITHUB_REF_NAME}"
-          fi
-          TAG="$TAG" IMAGE_LABEL="$IMAGE_LABEL" python3 -c 'import json, os; open("payload.json", "w").write(json.dumps({"version": os.environ["TAG"], "image_label": os.environ["IMAGE_LABEL"]}))'
-
-      - name: Send POST request
-        env:
           WEBHOOK_SECRET: ${{ secrets.TEST_ENV_WEBHOOK_SECRET }}
           WEBHOOK_URL: ${{ secrets.TEST_ENV_URL }}
         run: |
-          curl --fail -X POST \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $WEBHOOK_SECRET" \
-            --json-file payload.json \
-            "$WEBHOOK_URL/webhooks/v1/add_honcho_version"
+          python3 .github/scripts/fly_webhook_payload.py
+          chmod 600 payload.json curl-config
+
+      - name: Send POST request
+        run: |
+          # Secrets live in the mode-600 curl config file, never in argv.
+          curl --fail --silent --show-error -K curl-config --data-binary @payload.json -o /dev/null -w '%{http_code}\n'
