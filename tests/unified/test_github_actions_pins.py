@@ -38,7 +38,7 @@ APPROVED_ACTION_REFS = {
 
 APPROVED_ACTION_COUNTS = {
     "actions/attest-build-provenance": 1,
-    "actions/checkout": 8,
+    "actions/checkout": 10,
     "actions/setup-python": 2,
     "astral-sh/setup-uv": 2,
     "aws-actions/aws-secretsmanager-get-secrets": 1,
@@ -324,9 +324,6 @@ def test_fly_deploy_shell_does_not_interpolate_github_values() -> None:
     for workflow_name in FLY_DEPLOY_WORKFLOWS:
         workflow_path = WORKFLOWS_DIR / workflow_name
         relevant_steps = 0
-        image_name = (
-            "honcho-prod-image" if workflow_name == "fly-deploy-prod.yml" else "honcho-image"
-        )
 
         for mapping in _iter_mapping_nodes(_load_workflow(workflow_path)):
             run = _mapping_child(mapping, "run")
@@ -335,7 +332,7 @@ def test_fly_deploy_shell_does_not_interpolate_github_values() -> None:
             assert unsafe_expression.search(run.value) is None, (
                 f"GitHub value interpolated directly into shell in {workflow_path}"
             )
-            if "flyctl deploy" not in run.value and "curl --fail" not in run.value:
+            if "flyctl deploy" not in run.value and "fly_webhook_payload" not in run.value:
                 continue
 
             relevant_steps += 1
@@ -345,20 +342,12 @@ def test_fly_deploy_shell_does_not_interpolate_github_values() -> None:
                 value = _mapping_child(env, name)
                 assert isinstance(value, ScalarNode) and value.value == expected_value
 
-            assert 'if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]' in run.value
             if "flyctl deploy" in run.value:
                 assert 'IMAGE_LABEL="deployment-${INPUT_VERSION}"' in run.value
                 assert 'IMAGE_LABEL="deployment-${GITHUB_REF_NAME}"' in run.value
+                assert 'if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]' in run.value
             else:
-                assert 'TAG="$INPUT_VERSION"' in run.value
-                assert 'TAG="${GITHUB_REF_NAME#v}"' in run.value
-                assert (
-                    f'IMAGE_LABEL="{image_name}:deployment-' + '${INPUT_VERSION}"'
-                    in run.value
-                )
-                assert (
-                    f'IMAGE_LABEL="{image_name}:deployment-' + '${GITHUB_REF_NAME}"'
-                    in run.value
-                )
+                # Version branching moved into the encoder script; the shell only runs it.
+                assert "fly_webhook_payload" in run.value
 
         assert relevant_steps == 2

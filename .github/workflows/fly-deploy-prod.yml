@@ -46,23 +46,20 @@ jobs:
     needs: deploy-honcho-prod-image
     runs-on: ubuntu-latest
     steps:
-      - name: Send POST request
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Encode webhook JSON
         env:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
+          IMAGE_LABEL_PREFIX: "honcho-prod-image:deployment-"
+          WEBHOOK_SECRET: ${{ secrets.PROD_ENV_WEBHOOK_SECRET }}
+          WEBHOOK_URL: ${{ secrets.PROD_ENV_URL }}
         run: |
-          # Determine version and image label based on trigger type
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            TAG="$INPUT_VERSION"
-            IMAGE_LABEL="honcho-prod-image:deployment-${INPUT_VERSION}"
-          else
-            TAG="${GITHUB_REF_NAME#v}"
-            IMAGE_LABEL="honcho-prod-image:deployment-${GITHUB_REF_NAME}"
-          fi
-
-          curl --fail -X POST \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${{ secrets.PROD_ENV_WEBHOOK_SECRET }}" \
-            -d "{\"version\":\"$TAG\",\"image_label\":\"$IMAGE_LABEL\"}" \
-            "${{ secrets.PROD_ENV_URL }}/webhooks/v1/add_honcho_version"
+          python3 .github/scripts/fly_webhook_payload.py
+      - name: Send POST request
+        run: |
+          # Keep URL-derived diagnostics out of logs; curl exits nonzero on failure.
+          curl --fail --silent -K curl-config --data-binary @payload.json -o /dev/null
