@@ -335,7 +335,7 @@ def test_fly_deploy_shell_does_not_interpolate_github_values() -> None:
             assert unsafe_expression.search(run.value) is None, (
                 f"GitHub value interpolated directly into shell in {workflow_path}"
             )
-            if "flyctl deploy" not in run.value and "curl --fail" not in run.value:
+            if "flyctl deploy" not in run.value and "json.dumps" not in run.value:
                 continue
 
             relevant_steps += 1

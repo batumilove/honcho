@@ -46,7 +46,7 @@ jobs:
     needs: deploy-honcho-prod-image
     runs-on: ubuntu-latest
     steps:
-      - name: Send POST request
+      - name: Encode webhook JSON
         env:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
@@ -60,9 +60,15 @@ jobs:
             TAG="${GITHUB_REF_NAME#v}"
             IMAGE_LABEL="honcho-prod-image:deployment-${GITHUB_REF_NAME}"
           fi
+          TAG="$TAG" IMAGE_LABEL="$IMAGE_LABEL" python3 -c 'import json, os; open("payload.json", "w").write(json.dumps({"version": os.environ["TAG"], "image_label": os.environ["IMAGE_LABEL"]}))'
 
+      - name: Send POST request
+        env:
+          WEBHOOK_SECRET: ${{ secrets.PROD_ENV_WEBHOOK_SECRET }}
+          WEBHOOK_URL: ${{ secrets.PROD_ENV_URL }}
+        run: |
           curl --fail -X POST \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${{ secrets.PROD_ENV_WEBHOOK_SECRET }}" \
-            -d "{\"version\":\"$TAG\",\"image_label\":\"$IMAGE_LABEL\"}" \
-            "${{ secrets.PROD_ENV_URL }}/webhooks/v1/add_honcho_version"
+            -H "Authorization: Bearer $WEBHOOK_SECRET" \
+            --json-file payload.json \
+            "$WEBHOOK_URL/webhooks/v1/add_honcho_version"
