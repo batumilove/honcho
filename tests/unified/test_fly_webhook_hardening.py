@@ -5,7 +5,13 @@ Private helpers are intentionally imported from the workflow policy suite.
 """
 # pyright: reportPrivateUsage=none, reportImplicitRelativeImport=none
 
+import json
+import os
+import shlex
+import stat
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
@@ -22,9 +28,7 @@ SECRET_NAMES = (
     ("fly-deploy.yml", "TEST_ENV_WEBHOOK_SECRET", "TEST_ENV_URL"),
     ("fly-deploy-prod.yml", "PROD_ENV_WEBHOOK_SECRET", "PROD_ENV_URL"),
 )
-ENCODER_SCRIPT = (
-    Path(".github") / "scripts" / "fly_webhook_payload.py"
-)
+ENCODER_SCRIPT = Path(".github") / "scripts" / "fly_webhook_payload.py"
 
 
 def _step_by_name(workflow_name: str, step_name: str) -> yaml.MappingNode:
@@ -47,11 +51,10 @@ def _step_by_name(workflow_name: str, step_name: str) -> yaml.MappingNode:
 
 def _webhook_run(path: Path) -> tuple[str, yaml.MappingNode]:
     """Return the curl webhook step's run text and mapping."""
-    for mapping in _iter_mapping_nodes(_load_workflow(path)):
-        run = _mapping_child(mapping, "run")
-        if isinstance(run, yaml.ScalarNode) and "curl --fail" in run.value:
-            return run.value, mapping
-    raise AssertionError(f"webhook step not found in {path}")
+    mapping = _step_by_name(path.name, "Send POST request")
+    run = _mapping_child(mapping, "run")
+    assert isinstance(run, yaml.ScalarNode)
+    return run.value, mapping
 
 
 @pytest.mark.parametrize("workflow_name", FLY_DEPLOY_WORKFLOWS)
@@ -64,25 +67,37 @@ def test_webhook_json_is_encoded_not_shell_interpolated(workflow_name: str) -> N
     assert not _re.search(r"(?:^|\s)-d(?:\s|$)", run), (
         f"webhook body must not be assembled inline in {workflow_name}"
     )
-    assert "--data-binary @payload.json" in run, (
-        f"webhook must post encoded payload.json in {workflow_name}"
-    )
+    commands = [
+        line.strip()
+        for line in run.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert commands == [
+        "curl --fail --silent -K curl-config --data-binary @payload.json -o /dev/null"
+    ], f"unexpected webhook command in {workflow_name}: {commands}"
+    assert shlex.split(commands[0]) == [
+        "curl",
+        "--fail",
+        "--silent",
+        "-K",
+        "curl-config",
+        "--data-binary",
+        "@payload.json",
+        "-o",
+        "/dev/null",
+    ]
 
     # A dedicated step must encode the payload via the checked-in encoder script.
     encoder = _step_by_name(workflow_name, "Encode webhook JSON")
     run_node = _mapping_child(encoder, "run")
     assert isinstance(run_node, yaml.ScalarNode)
-    assert str(ENCODER_SCRIPT) in run_node.value, (
-        f"encoder step must run {ENCODER_SCRIPT} in {workflow_name}"
-    )
+    assert run_node.value.strip() == f"python3 {ENCODER_SCRIPT}"
     assert ENCODER_SCRIPT.is_file(), f"missing encoder script {ENCODER_SCRIPT}"
     script = ENCODER_SCRIPT.read_text(encoding="utf-8")
     assert "json.dump" in script, "encoder must use the json module"
 
 
-@pytest.mark.parametrize(
-    ("workflow_name", "secret_name", "url_name"), SECRET_NAMES
-)
+@pytest.mark.parametrize(("workflow_name", "secret_name", "url_name"), SECRET_NAMES)
 def test_webhook_secrets_reach_curl_without_command_interpolation(
     workflow_name: str, secret_name: str, url_name: str
 ) -> None:
@@ -98,6 +113,11 @@ def test_webhook_secrets_reach_curl_without_command_interpolation(
         "GITHUB_EVENT_NAME": "${{ github.event_name }}",
         "GITHUB_REF_NAME": "${{ github.ref_name }}",
         "INPUT_VERSION": "${{ github.event.inputs.version }}",
+        "IMAGE_LABEL_PREFIX": (
+            "honcho-prod-image:deployment-"
+            if workflow_name == "fly-deploy-prod.yml"
+            else "honcho-image:deployment-"
+        ),
         "WEBHOOK_SECRET": f"${{{{ secrets.{secret_name} }}}}",
         "WEBHOOK_URL": f"${{{{ secrets.{url_name} }}}}",
     }.items():
@@ -105,9 +125,7 @@ def test_webhook_secrets_reach_curl_without_command_interpolation(
         assert isinstance(node, yaml.ScalarNode) and node.value == value, name
 
 
-@pytest.mark.parametrize(
-    ("workflow_name", "secret_name", "url_name"), SECRET_NAMES
-)
+@pytest.mark.parametrize(("workflow_name", "secret_name", "url_name"), SECRET_NAMES)
 def test_secret_values_do_not_appear_in_workflow_text(
     workflow_name: str, secret_name: str, url_name: str
 ) -> None:
@@ -136,93 +154,157 @@ def test_encoder_step_binds_every_env_name_the_script_reads() -> None:
         encoder = _step_by_name(workflow_name, "Encode webhook JSON")
         env = _mapping_child(encoder, "env")
         assert isinstance(env, yaml.MappingNode)
-        bound = {
-            k.value
-            for k, _ in env.value
-            if isinstance(k, yaml.ScalarNode)
-        }
+        bound = {k.value for k, _ in env.value if isinstance(k, yaml.ScalarNode)}
         missing = read_names - bound
         assert not missing, f"{workflow_name}: script reads unbound env {missing}"
         # Checkout must precede the encoder step so the script exists at runtime.
         doc = _load_workflow(WORKFLOWS_DIR / workflow_name)
+        assert isinstance(doc, yaml.MappingNode)
+        jobs = _mapping_child(doc, "jobs")
+        assert isinstance(jobs, yaml.MappingNode)
+        job = _mapping_child(jobs, "prompt-service")
+        assert isinstance(job, yaml.MappingNode)
+        steps_node = _mapping_child(job, "steps")
+        assert isinstance(steps_node, yaml.SequenceNode)
         steps = [
-            node
-            for node in _iter_mapping_nodes(doc)
-            if any(
-                isinstance((u := _mapping_child(node, "uses")), yaml.ScalarNode)
-                and u.value.startswith("actions/checkout@")
-                for _ in [0]
-            )
+            step for step in steps_node.value if isinstance(step, yaml.MappingNode)
         ]
-        assert steps, f"{workflow_name}: prompt-service job must check out the repo"
+        encoder_indices: list[int] = []
+        for index, step in enumerate(steps):
+            name = _mapping_child(step, "name")
+            if (
+                isinstance(name, yaml.ScalarNode)
+                and name.value == "Encode webhook JSON"
+            ):
+                encoder_indices.append(index)
+        assert encoder_indices == [1], f"{workflow_name}: encoder must be step 2"
+        checkout = steps[0]
+        uses = _mapping_child(checkout, "uses")
+        assert isinstance(uses, yaml.ScalarNode)
+        assert uses.value == (
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        )
+        checkout_with = _mapping_child(checkout, "with")
+        assert isinstance(checkout_with, yaml.MappingNode)
+        persist = _mapping_child(checkout_with, "persist-credentials")
+        assert isinstance(persist, yaml.ScalarNode) and persist.value == "false"
 
 
-def test_encoder_produces_valid_json_and_argv_free_curl_config() -> None:
-    """Run the real encoder with hostile inputs; verify outputs byte-exactly."""
-    workdir = WORKFLOWS_DIR.parent.parent
-    hostile_env = {
+def test_encoder_produces_exact_private_files_and_curl_sends_exact_bytes(
+    tmp_path: Path,
+) -> None:
+    """Exercise the real encoder and curl against a local capture server."""
+    captured: dict[str, bytes | str] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers["Content-Length"])
+            captured["path"] = self.path
+            captured["authorization"] = self.headers["Authorization"]
+            captured["body"] = self.rfile.read(length)
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.handle_request, daemon=True)
+    thread.start()
+    secret = 's3cr et"x\\tail'
+    env = {
+        **os.environ,
         "GITHUB_EVENT_NAME": "push",
         "GITHUB_REF_NAME": 'v1.2."3',
         "INPUT_VERSION": "ignored",
         "IMAGE_LABEL_PREFIX": 'img:deployment-"',
-        "WEBHOOK_SECRET": 's3cr et"x',
-        "WEBHOOK_URL": "https://hook.example",
+        "WEBHOOK_SECRET": secret,
+        "WEBHOOK_URL": f"http://127.0.0.1:{server.server_port}",
     }
     completed = subprocess.run(
-        ["python3", str(ENCODER_SCRIPT)],
+        ["python3", str(ENCODER_SCRIPT.resolve())],
         capture_output=True,
-        cwd=workdir,
-        env=hostile_env,
+        cwd=tmp_path,
+        env=env,
         text=True,
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
-    try:
-        payload_text = (workdir / "payload.json").read_text()
-        dq = chr(34)
-        bs = chr(92)
-        expected_payload = (
-            '{"version": "1.2.'
-            + bs
-            + dq
-            + '3", "image_label": "img:deployment-'
-            + bs
-            + dq
-            + 'v1.2.'
-            + bs
-            + dq
-            + '3"}'
-        )
-        assert payload_text == expected_payload, payload_text
-        config = (workdir / "curl-config").read_text()
-        assert config == (
-            'header = "Content-Type: application/json"\n'
-            'header = "Authorization: Bearer s3cr et\'x"\n'
-            'url = "https://hook.example/webhooks/v1/add_honcho_version"\n'
-        )
-        # curl itself must parse the config without complaint (DNS failure is fine).
-        curl = subprocess.run(
-            [
-                "curl",
-                "--fail",
-                "-sS",
-                "-K",
-                str(workdir / "curl-config"),
-                "--data-binary",
-                f"@{workdir / 'payload.json'}",
-                "-o",
-                "/dev/null",
-                "--max-time",
-                "2",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert curl.returncode in (0, 6, 7, 28), curl.stderr
-    finally:
-        for name in ("payload.json", "curl-config"):
-            (workdir / name).unlink(missing_ok=True)
+    payload = tmp_path / "payload.json"
+    config_path = tmp_path / "curl-config"
+    expected_payload = json.dumps(
+        {
+            "version": '1.2."3',
+            "image_label": 'img:deployment-"v1.2."3',
+        }
+    ).encode()
+    assert payload.read_bytes() == expected_payload
+    expected_config = (
+        'header = "Content-Type: application/json"\n'
+        'header = "Authorization: Bearer s3cr et\\"x\\\\tail"\n'
+        f'url = "http://127.0.0.1:{server.server_port}/webhooks/v1/add_honcho_version"\n'
+    ).encode()
+    assert config_path.read_bytes() == expected_config
+    assert stat.S_IMODE(payload.stat().st_mode) == 0o600
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+    curl = subprocess.run(
+        [
+            "curl",
+            "--fail",
+            "--silent",
+            "-K",
+            str(config_path),
+            "--data-binary",
+            f"@{payload}",
+            "-o",
+            "/dev/null",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    thread.join(timeout=2)
+    server.server_close()
+    assert curl.returncode == 0, curl.stderr
+    assert captured == {
+        "path": "/webhooks/v1/add_honcho_version",
+        "authorization": f"Bearer {secret}",
+        "body": expected_payload,
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("WEBHOOK_SECRET", "secret\nheader = injected"),
+        ("WEBHOOK_URL", "https://host\rurl = injected"),
+    ),
+)
+def test_encoder_rejects_config_line_injection(
+    tmp_path: Path, name: str, value: str
+) -> None:
+    env = {
+        **os.environ,
+        "GITHUB_EVENT_NAME": "push",
+        "GITHUB_REF_NAME": "v1",
+        "INPUT_VERSION": "ignored",
+        "IMAGE_LABEL_PREFIX": "img:deployment-",
+        "WEBHOOK_SECRET": "secret",
+        "WEBHOOK_URL": "https://hook.example",
+        name: value,
+    }
+    completed = subprocess.run(
+        ["python3", str(ENCODER_SCRIPT.resolve())],
+        capture_output=True,
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert not (tmp_path / "payload.json").exists()
+    assert not (tmp_path / "curl-config").exists()
 
 
 def test_encoder_script_has_no_hardcoded_secrets() -> None:

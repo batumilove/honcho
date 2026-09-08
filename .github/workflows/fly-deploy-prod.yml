@@ -59,8 +59,7 @@ jobs:
           WEBHOOK_URL: ${{ secrets.PROD_ENV_URL }}
         run: |
           python3 .github/scripts/fly_webhook_payload.py
-          chmod 600 payload.json curl-config
       - name: Send POST request
         run: |
-          # Secrets live in the mode-600 curl config file, never in argv.
-          curl --fail --silent --show-error -K curl-config --data-binary @payload.json -o /dev/null -w '%{http_code}'
+          # Keep URL-derived diagnostics out of logs; curl exits nonzero on failure.
+          curl --fail --silent -K curl-config --data-binary @payload.json -o /dev/null
