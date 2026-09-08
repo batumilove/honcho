@@ -173,16 +173,30 @@ def test_encoder_step_binds_every_env_name_the_script_reads() -> None:
         # Checkout must precede the encoder step so the script exists at runtime.
         doc = _load_workflow(WORKFLOWS_DIR / workflow_name)
         assert isinstance(doc, yaml.MappingNode)
+        assert _mapping_child(doc, "env") is None
         jobs = _mapping_child(doc, "jobs")
         assert isinstance(jobs, yaml.MappingNode)
         job = _mapping_child(jobs, "prompt-service")
         assert isinstance(job, yaml.MappingNode)
+        job_keys = [
+            key.value for key, _ in job.value if isinstance(key, yaml.ScalarNode)
+        ]
+        assert job_keys == ["name", "needs", "runs-on", "steps"]
+        assert _mapping_child(job, "env") is None
+        expected_deploy_job = (
+            "deploy-honcho-prod-image"
+            if workflow_name == "fly-deploy-prod.yml"
+            else "deploy-honcho-image"
+        )
+        needs = _mapping_child(job, "needs")
+        runs_on = _mapping_child(job, "runs-on")
+        assert isinstance(needs, yaml.ScalarNode) and needs.value == expected_deploy_job
+        assert isinstance(runs_on, yaml.ScalarNode) and runs_on.value == "ubuntu-latest"
         steps_node = _mapping_child(job, "steps")
         assert isinstance(steps_node, yaml.SequenceNode)
-        steps = [
-            step for step in steps_node.value if isinstance(step, yaml.MappingNode)
-        ]
-        assert len(steps) == 3, f"{workflow_name}: unexpected prompt-service step"
+        assert len(steps_node.value) == 3
+        assert all(isinstance(step, yaml.MappingNode) for step in steps_node.value)
+        steps = cast(list[yaml.MappingNode], steps_node.value)
         encoder_indices: list[int] = []
         for index, step in enumerate(steps):
             name = _mapping_child(step, "name")
@@ -205,6 +219,51 @@ def test_encoder_step_binds_every_env_name_the_script_reads() -> None:
         send_name = _mapping_child(steps[2], "name")
         assert isinstance(send_name, yaml.ScalarNode)
         assert send_name.value == "Send POST request"
+
+
+@pytest.mark.parametrize("workflow_name", FLY_DEPLOY_WORKFLOWS)
+def test_fly_workflow_triggers_and_permissions_are_exact(workflow_name: str) -> None:
+    doc = _load_workflow(WORKFLOWS_DIR / workflow_name)
+    assert isinstance(doc, yaml.MappingNode)
+    permissions = _mapping_child(doc, "permissions")
+    assert isinstance(permissions, yaml.MappingNode)
+    assert [
+        (key.value, value.value)
+        for key, value in permissions.value
+        if isinstance(key, yaml.ScalarNode) and isinstance(value, yaml.ScalarNode)
+    ] == [("contents", "read")]
+
+    triggers = _mapping_child(doc, "on")
+    assert isinstance(triggers, yaml.MappingNode)
+    assert [
+        key.value for key, _ in triggers.value if isinstance(key, yaml.ScalarNode)
+    ] == [
+        "push",
+        "workflow_dispatch",
+    ]
+    push = _mapping_child(triggers, "push")
+    dispatch = _mapping_child(triggers, "workflow_dispatch")
+    assert isinstance(push, yaml.MappingNode)
+    assert isinstance(dispatch, yaml.MappingNode)
+    tags = _mapping_child(push, "tags")
+    assert isinstance(tags, yaml.SequenceNode)
+    assert [tag.value for tag in tags.value if isinstance(tag, yaml.ScalarNode)] == [
+        "v*"
+    ]
+    inputs = _mapping_child(dispatch, "inputs")
+    assert isinstance(inputs, yaml.MappingNode)
+    version = _mapping_child(inputs, "version")
+    assert isinstance(version, yaml.MappingNode)
+    assert [
+        (key.value, value.value)
+        for key, value in version.value
+        if isinstance(key, yaml.ScalarNode) and isinstance(value, yaml.ScalarNode)
+    ] == [
+        ("description", "Version to deploy (without v prefix)"),
+        ("required", "true"),
+        ("type", "string"),
+        ("default", "manual"),
+    ]
 
 
 def test_encoder_produces_exact_private_files_and_curl_sends_exact_bytes(
@@ -289,6 +348,87 @@ def test_encoder_produces_exact_private_files_and_curl_sends_exact_bytes(
         "authorization": f"Bearer {secret}",
         "body": expected_payload,
     }
+
+
+@pytest.mark.parametrize(
+    (
+        "workflow_name",
+        "event",
+        "ref",
+        "input_version",
+        "expected_version",
+        "expected_label",
+    ),
+    (
+        (
+            "fly-deploy.yml",
+            "push",
+            "v2.3.4",
+            "ignored",
+            "2.3.4",
+            "honcho-image:deployment-v2.3.4",
+        ),
+        (
+            "fly-deploy.yml",
+            "workflow_dispatch",
+            "main",
+            "2.3.4",
+            "2.3.4",
+            "honcho-image:deployment-2.3.4",
+        ),
+        (
+            "fly-deploy-prod.yml",
+            "push",
+            "v2.3.4",
+            "ignored",
+            "2.3.4",
+            "honcho-prod-image:deployment-v2.3.4",
+        ),
+        (
+            "fly-deploy-prod.yml",
+            "workflow_dispatch",
+            "main",
+            "2.3.4",
+            "2.3.4",
+            "honcho-prod-image:deployment-2.3.4",
+        ),
+    ),
+)
+def test_encoder_preserves_trigger_and_environment_label_semantics(
+    tmp_path: Path,
+    workflow_name: str,
+    event: str,
+    ref: str,
+    input_version: str,
+    expected_version: str,
+    expected_label: str,
+) -> None:
+    prefix = (
+        "honcho-prod-image:deployment-"
+        if workflow_name == "fly-deploy-prod.yml"
+        else "honcho-image:deployment-"
+    )
+    env = {
+        **os.environ,
+        "GITHUB_EVENT_NAME": event,
+        "GITHUB_REF_NAME": ref,
+        "INPUT_VERSION": input_version,
+        "IMAGE_LABEL_PREFIX": prefix,
+        "WEBHOOK_SECRET": "secret",
+        "WEBHOOK_URL": "https://hook.example",
+    }
+    completed = subprocess.run(
+        ["python3", str(ENCODER_SCRIPT.resolve())],
+        capture_output=True,
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert (tmp_path / "payload.json").read_bytes() == json.dumps(
+        {"version": expected_version, "image_label": expected_label}
+    ).encode()
 
 
 def test_private_writer_is_private_before_atomic_replace(
