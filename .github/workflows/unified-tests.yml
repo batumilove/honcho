@@ -74,69 +74,72 @@ jobs:
     runs-on: ubuntu-latest
     needs: [start-runner, unified-tests]
     if: always() && needs.start-runner.outputs.machine-id != ''
-    env:
-      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_TESTING }}
-      GITHUB_TOKEN: ${{ secrets.GH_TOKEN_ACTIONS }}
-      FLY_RUNNER_APP: ivysaur
     steps:
       - name: Setup Fly CLI
         uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # Node.js 24 commit
 
       - name: Cleanup fly machine
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_TESTING }}
+          FLY_RUNNER_APP: ivysaur
+          MACHINE_ID: ${{ needs.start-runner.outputs.machine-id }}
         run: |
           set -euo pipefail
-          MACHINE_ID="${{ needs.start-runner.outputs.machine-id }}"
           if [ -z "$MACHINE_ID" ]; then
             echo "No machine ID provided, skipping Fly cleanup."
             exit 0
           fi
 
-          echo "🧹 Cleaning up machine: $MACHINE_ID"
-          flyctl machines stop "$MACHINE_ID" -a "$FLY_RUNNER_APP" || echo "Machine may already be stopped"
-          flyctl machines destroy "$MACHINE_ID" -a "$FLY_RUNNER_APP" --force || echo "Failed to destroy machine"
+          echo "Cleaning up machine: $MACHINE_ID"
+          if ! flyctl machines stop "$MACHINE_ID" -a "$FLY_RUNNER_APP" \
+              && ! flyctl machines status "$MACHINE_ID" -a "$FLY_RUNNER_APP" >/dev/null 2>&1; then
+            echo "::error::Failed to stop machine ${MACHINE_ID} and it still exists"
+            exit 1
+          fi
+          if ! flyctl machines destroy "$MACHINE_ID" -a "$FLY_RUNNER_APP" --force \
+              && ! flyctl machines status "$MACHINE_ID" -a "$FLY_RUNNER_APP" >/dev/null 2>&1; then
+            echo "::error::Failed to destroy machine ${MACHINE_ID} and it still exists"
+            exit 1
+          fi
 
       - name: Cleanup GitHub runner
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN_ACTIONS }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUNNER_NAME: ${{ needs.start-runner.outputs.runner-name }}
         run: |
           set -euo pipefail
-          RUNNER_NAME="${{ needs.start-runner.outputs.runner-name }}"
-          FALLBACK_LABEL="${{ github.run_id }}"
+          echo "Cleaning up GitHub runner (name: ${RUNNER_NAME:-unknown})"
 
-          echo "🗑️ Cleaning up GitHub runner (name: ${RUNNER_NAME:-unknown}, label: ${FALLBACK_LABEL})"
+          HEADER_FILE=$(mktemp)
+          chmod 0600 "$HEADER_FILE"
+          printf 'Authorization: Bearer %s\nAccept: application/vnd.github+json\n' "$GITHUB_TOKEN" >"$HEADER_FILE"
+          trap 'rm -f "$HEADER_FILE"' EXIT
 
-          RUNNERS_RESPONSE=$(curl -s \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runners")
+          RUNNERS_RESPONSE=$(curl -s --fail --header @"$HEADER_FILE" \
+            "https://api.github.com/repos/${REPOSITORY}/actions/runners")
 
           if echo "$RUNNERS_RESPONSE" | grep -q '"message"'; then
-            echo "⚠️ Failed to fetch runners: $(echo "$RUNNERS_RESPONSE" | jq -r '.message')"
-            exit 0
+            echo "::error::Failed to fetch runners: $(echo "$RUNNERS_RESPONSE" | jq -r '.message')"
+            exit 1
           fi
 
-          RUNNER_ID=""
-          if [ -n "$RUNNER_NAME" ]; then
-            RUNNER_ID=$(echo "$RUNNERS_RESPONSE" | jq -r --arg name "$RUNNER_NAME" '.runners[]? | select(.name == $name) | .id')
-          fi
-
-          if [ -z "$RUNNER_ID" ]; then
-            RUNNER_ID=$(echo "$RUNNERS_RESPONSE" | jq -r --arg label "$FALLBACK_LABEL" '.runners[]? | select([.labels[].name] | index($label)) | .id' | head -n 1)
-          fi
+          # Match the exact runner name for this run; no bare-label fallback.
+          RUNNER_ID=$(echo "$RUNNERS_RESPONSE" | jq -r --arg name "$RUNNER_NAME" '.runners[]? | select(.name == $name) | .id' | head -n 1)
 
           if [ -z "$RUNNER_ID" ] || [ "$RUNNER_ID" = "null" ]; then
-            echo "⚠️ Runner not found, nothing to delete."
+            echo "Runner not found, nothing to delete."
             exit 0
           fi
 
-          DELETE_RESPONSE=$(curl -s -w "%{http_code}" \
-            -X DELETE \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runners/$RUNNER_ID")
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+            --header @"$HEADER_FILE" \
+            "https://api.github.com/repos/${REPOSITORY}/actions/runners/$RUNNER_ID")
 
-          HTTP_CODE="${DELETE_RESPONSE: -3}"
           if [ "$HTTP_CODE" = "204" ]; then
-            echo "✅ Successfully deleted runner."
+            echo "Successfully deleted runner."
           else
-            echo "⚠️ Failed to delete runner. HTTP code: $HTTP_CODE"
-            echo "Response: ${DELETE_RESPONSE%???}"
+            echo "::error::Failed to delete runner ${RUNNER_NAME} (id ${RUNNER_ID}). HTTP code: $HTTP_CODE"
+            exit 1
           fi
