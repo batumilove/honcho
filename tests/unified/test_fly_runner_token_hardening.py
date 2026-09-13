@@ -224,15 +224,15 @@ class TestCleanupFailClosed:
 
     def test_runner_lookup_is_exactly_one_name_select_no_label_fallback(self) -> None:
         body = self._cleanup_steps()["Cleanup GitHub runner"]
-        # Count ALL jq invocations touching the runners array, whatever their
-        # argument shape, so a fallback lookup cannot coexist with the safe one.
-        lookups = re.findall(r"jq\s+-r\s+--arg\s+(\w+)\s+[^\n]*\.runners\[\]\?", body)
-        lookups += re.findall(r"jq\s+-r(?!\s+--arg\s+name)[^\n]*\.runners\[\]\?", body)
+        # Count EVERY jq invocation that references the runners array in any
+        # shape (any flags, any filter syntax), so no fallback lookup can
+        # coexist with the single approved one.
+        lookups = [m.group(0) for m in re.finditer(r"jq\b[^\n]*runners", body)]
         assert len(lookups) == 1, (
             f"exactly one runner lookup expected, found {len(lookups)}: {lookups}"
         )
-        assert lookups[0] == "name", (
-            f"runner lookup must key on --arg name, got {lookups[0]!r}"
+        assert re.search(r"jq\s+-r\s+--arg\s+name\s", lookups[0]), (
+            f"runner lookup must key on --arg name, got: {lookups[0]!r}"
         )
         assert "select(.name == $name)" in body, (
             "runner lookup must select on the exact runner name"
