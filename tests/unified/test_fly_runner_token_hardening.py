@@ -1,3 +1,4 @@
+# pyright: reportUnknownParameterType=none, reportMissingParameterType=none, reportUnknownVariableType=none, reportUnknownArgumentType=none, reportUnknownMemberType=none, reportImplicitStringConcatenation=none
 """Fail-closed policy tests: Fly runner token handling.
 
 Structurally binds the ephemeral Fly test-runner workflows so GitHub Actions
