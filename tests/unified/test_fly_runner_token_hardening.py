@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -36,12 +37,14 @@ def _load(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _doc(path: Path) -> dict:
-    return yaml.safe_load(_load(path))
+def _doc(path: Path) -> dict[str, Any]:
+    doc: dict[str, Any] = yaml.safe_load(_load(path))
+    return doc
 
 
-def _jobs(path: Path) -> dict:
-    return _doc(path).get("jobs", {})
+def _jobs(path: Path) -> dict[str, Any]:
+    jobs: dict[str, Any] = _doc(path).get("jobs", {})
+    return jobs
 
 
 def _run_steps(path: Path) -> list[tuple[str, str, str]]:
@@ -54,7 +57,7 @@ def _run_steps(path: Path) -> list[tuple[str, str, str]]:
     return out
 
 
-def _secret_refs(node) -> set[str]:
+def _secret_refs(node: Any) -> set[str]:
     """Recursively collect secret names referenced via ${{ secrets.X }}."""
     refs: set[str] = set()
     if isinstance(node, dict):
