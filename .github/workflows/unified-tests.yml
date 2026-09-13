@@ -91,16 +91,16 @@ jobs:
           fi
 
           echo "Cleaning up machine: $MACHINE_ID"
-          if ! flyctl machines stop "$MACHINE_ID" -a "$FLY_RUNNER_APP" \
-              && ! flyctl machines status "$MACHINE_ID" -a "$FLY_RUNNER_APP" >/dev/null 2>&1; then
-            echo "::error::Failed to stop machine ${MACHINE_ID} and it still exists"
+          # Stop is best-effort: a stopped machine must still be destroyed.
+          flyctl machines stop "$MACHINE_ID" -a "$FLY_RUNNER_APP" || echo "stop: machine may already be stopped"
+          flyctl machines destroy "$MACHINE_ID" -a "$FLY_RUNNER_APP" --force || true
+
+          # Fail closed: success requires the machine to be gone.
+          if flyctl machines status "$MACHINE_ID" -a "$FLY_RUNNER_APP" >/dev/null 2>&1; then
+            echo "::error::Machine ${MACHINE_ID} still exists after cleanup"
             exit 1
           fi
-          if ! flyctl machines destroy "$MACHINE_ID" -a "$FLY_RUNNER_APP" --force \
-              && ! flyctl machines status "$MACHINE_ID" -a "$FLY_RUNNER_APP" >/dev/null 2>&1; then
-            echo "::error::Failed to destroy machine ${MACHINE_ID} and it still exists"
-            exit 1
-          fi
+          echo "Machine ${MACHINE_ID} is gone."
 
       - name: Cleanup GitHub runner
         env:
@@ -137,8 +137,8 @@ jobs:
             --header @"$HEADER_FILE" \
             "https://api.github.com/repos/${REPOSITORY}/actions/runners/$RUNNER_ID")
 
-          if [ "$HTTP_CODE" = "204" ]; then
-            echo "Successfully deleted runner."
+          if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "404" ]; then
+            echo "Successfully deleted runner (HTTP ${HTTP_CODE}; 404 = already gone)."
           else
             echo "::error::Failed to delete runner ${RUNNER_NAME} (id ${RUNNER_ID}). HTTP code: $HTTP_CODE"
             exit 1
