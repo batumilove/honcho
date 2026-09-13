@@ -196,23 +196,26 @@ class TestCleanupFailClosed:
             "succeeds (machine exists), emit ::error:: and exit 1 in the same "
             "branch"
         )
-        # No `|| echo`/`|| true` may appear after the status gate.
+        # No failure-masking construct may appear after the status gate.
         gate = gate_re.search(body)
         assert gate, "unreachable"  # pragma: no cover
-        assert "|| true" not in body[gate.start() :], (
-            "post-verification failures must not be masked"
-        )
+        tail = body[gate.start() :]
+        for mask in ("|| true", "|| echo", "|| :", "|| exit 0"):
+            assert mask not in tail, (
+                f"post-verification failures must not be masked (found {mask!r})"
+            )
 
     def test_runner_delete_success_is_exactly_204_or_404(self) -> None:
         body = self._cleanup_steps()["Cleanup GitHub runner"]
         cond_re = re.compile(
-            r'if \[ "\$HTTP_CODE" = "204" \] \|\| \[ "\$HTTP_CODE" = "404" \]; then\n'
+            r'^\s*if \[ "\$HTTP_CODE" = "204" \] \|\| \[ "\$HTTP_CODE" = "404" \]; then\n'
             r"\s*echo \"Successfully deleted runner \(HTTP \${HTTP_CODE}; 404 = already gone\)\.\"\n"
             r"\s*else\n"
             r"\s*echo \"::error::Failed to delete runner \${RUNNER_NAME} \(id \${RUNNER_ID}\)\. "
             r"HTTP code: \$HTTP_CODE\"\n"
             r"\s*exit 1\n"
-            r"\s*fi"
+            r"\s*fi$",
+            re.MULTILINE,
         )
         assert cond_re.search(body), (
             "runner delete must accept exactly HTTP 204 or 404 as success and "
@@ -221,12 +224,15 @@ class TestCleanupFailClosed:
 
     def test_runner_lookup_is_exactly_one_name_select_no_label_fallback(self) -> None:
         body = self._cleanup_steps()["Cleanup GitHub runner"]
-        lookups = re.findall(r"jq -r --arg (\w+) [^\n]*\.runners\[\]\?", body)
+        # Count ALL jq invocations touching the runners array, whatever their
+        # argument shape, so a fallback lookup cannot coexist with the safe one.
+        lookups = re.findall(r"jq\s+-r\s+--arg\s+(\w+)\s+[^\n]*\.runners\[\]\?", body)
+        lookups += re.findall(r"jq\s+-r(?!\s+--arg\s+name)[^\n]*\.runners\[\]\?", body)
         assert len(lookups) == 1, (
             f"exactly one runner lookup expected, found {len(lookups)}: {lookups}"
         )
         assert lookups[0] == "name", (
-            f"runner lookup must key on --arg name, got --arg {lookups[0]}"
+            f"runner lookup must key on --arg name, got {lookups[0]!r}"
         )
         assert "select(.name == $name)" in body, (
             "runner lookup must select on the exact runner name"
