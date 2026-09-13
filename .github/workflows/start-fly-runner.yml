@@ -42,8 +42,10 @@ jobs:
 
       - name: Generate unique runner labels
         id: generate-labels
+        env:
+          RUN_ID: ${{ github.run_id }}
         run: |
-          UNIQUE_LABELS='"self-hosted","${{ github.run_id }}"'
+          UNIQUE_LABELS='"self-hosted","'"$RUN_ID"'"'
           echo "Generated unique labels: $UNIQUE_LABELS"
           echo "labels=$UNIQUE_LABELS" >> "$GITHUB_OUTPUT"
 
@@ -61,14 +63,19 @@ jobs:
       - name: Set GH_TOKEN in Fly secrets
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_TESTING }}
+          GH_TOKEN_VALUE: ${{ secrets.GH_TOKEN_ACTIONS }}
         run: |
+          set -euo pipefail
           echo "Setting GH_TOKEN in Fly secrets..."
-          flyctl secrets set GH_TOKEN="${{ secrets.GH_TOKEN_ACTIONS }}" -a "${FLY_RUNNER_APP}"
+          # The token travels via stdin only: never in argv, never in the
+          # generated script body.
+          printf 'GH_TOKEN=%s' "$GH_TOKEN_VALUE" | flyctl secrets upload -a "${FLY_RUNNER_APP}" -
 
       - name: Create Fly machine
         id: machine-management
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_TESTING }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
 
@@ -76,7 +83,7 @@ jobs:
           FULL_OUTPUT=$(flyctl machines run "${FLY_RUNNER_IMAGE}" \
             -a "${FLY_RUNNER_APP}" \
             --region "${FLY_RUNNER_REGION}" \
-            --env RUN_ID=${{ github.run_id }} \
+            --env RUN_ID="${RUN_ID}" \
             --env TEST_TYPE="honcho-unified-runner" \
             --vm-size shared-cpu-8x \
             --vm-memory 8192 )
@@ -89,6 +96,8 @@ jobs:
         id: wait-for-runner
         env:
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN_ACTIONS }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
           MAX_WAIT: 420
         run: |
           set -euo pipefail
@@ -97,16 +106,21 @@ jobs:
             exit 1
           fi
 
-          EXPECTED_RUNNER_NAME="honcho-unified-runner-${{ github.run_id }}"
+          EXPECTED_RUNNER_NAME="honcho-unified-runner-${RUN_ID}"
           echo "Waiting for runner named ${EXPECTED_RUNNER_NAME} to come online..."
+
+          # Auth headers live in a private file so the token never appears
+          # in argv or the generated script body.
+          HEADER_FILE=$(mktemp)
+          chmod 0600 "$HEADER_FILE"
+          printf 'Authorization: Bearer %s\nAccept: application/vnd.github.v3+json\n' "$GITHUB_TOKEN" >"$HEADER_FILE"
+          trap 'rm -f "$HEADER_FILE"' EXIT
 
           WAITED=0
           RUNNER_NAME=""
-          while [ $WAITED -lt $MAX_WAIT ]; do
-            RESPONSE=$(curl -s \
-              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/runners")
+          while [ "$WAITED" -lt "$MAX_WAIT" ]; do
+            RESPONSE=$(curl -s --fail --header @"$HEADER_FILE" \
+              "https://api.github.com/repos/${REPOSITORY}/actions/runners")
 
             if echo "$RESPONSE" | grep -q '"message"'; then
               echo "API Error: $(echo "$RESPONSE" | jq -r '.message')"
@@ -118,13 +132,13 @@ jobs:
 
             if [ -n "$RUNNER_LINE" ]; then
               RUNNER_NAME=$(echo "$RUNNER_LINE" | cut -d'|' -f1)
-              echo "✅ Found runner: ${RUNNER_NAME}"
+              echo "Found runner: ${RUNNER_NAME}"
               echo "ready=true" >> "$GITHUB_OUTPUT"
               echo "runner-name=${RUNNER_NAME}" >> "$GITHUB_OUTPUT"
               exit 0
             fi
 
-            echo "⏳ Waiting for runner... (${WAITED}s elapsed)"
+            echo "Waiting for runner... (${WAITED}s elapsed)"
             sleep 15
             WAITED=$((WAITED + 15))
           done
