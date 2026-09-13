@@ -224,10 +224,16 @@ class TestCleanupFailClosed:
 
     def test_runner_lookup_is_exactly_one_name_select_no_label_fallback(self) -> None:
         body = self._cleanup_steps()["Cleanup GitHub runner"]
-        # Count EVERY jq invocation that references the runners array in any
-        # shape (any flags, any filter syntax), so no fallback lookup can
-        # coexist with the single approved one.
-        lookups = [m.group(0) for m in re.finditer(r"jq\b[^\n]*runners", body)]
+        # Partition the script at every `jq` token start; each chunk (up to
+        # the next jq invocation) is one invocation regardless of newlines or
+        # same-line multiples. Count chunks that reference the runners array.
+        starts = [m.start() for m in re.finditer(r"\bjq\b", body)]
+        assert starts, "no jq runner lookup found at all"
+        chunks = []
+        for i, s in enumerate(starts):
+            end = starts[i + 1] if i + 1 < len(starts) else len(body)
+            chunks.append(body[s:end])
+        lookups = [c for c in chunks if "runners" in c]
         assert len(lookups) == 1, (
             f"exactly one runner lookup expected, found {len(lookups)}: {lookups}"
         )
