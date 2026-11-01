@@ -486,3 +486,18 @@ The Hermes pin is the `hermes-agent` entry in `tests/pyproject.toml`; bump it to
 with `uv lock` in `tests/`. Keep test dependencies out of the plugin's own
 `pyproject.toml`: Hermes locks that file, and a `hermes-agent` entry there breaks every
 install.
+
+
+## Startup and unavailable-memory recovery
+
+Eager session setup waits briefly before the agent can continue with memory
+initialization pending. One initializer per profile keeps admission across module
+reloads until its actual SDK work returns. Failed eager tools startup retries on
+an explicit tool request; ordinary hooks do not continually restart a failed call.
+
+Permitted turns accepted while eager/context memory is unavailable are retained
+privately for explicit reconciliation. This is local retention, not a successful
+Honcho write. The provider never automatically replays or expires those records.
+See [pending-turn recovery](docs/PENDING-TURN-RECOVERY.md) for the read-only
+inventory and the approval, identity, receipt and ambiguity checks required before
+any replay. The existing save-messages and bot-ingestion policies still apply.

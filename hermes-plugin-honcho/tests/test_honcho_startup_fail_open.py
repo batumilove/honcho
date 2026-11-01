@@ -275,6 +275,7 @@ def test_honcho_tools_eager_init_failure_does_not_leave_ready_manager(monkeypatc
     assert provider._session_initialized is False
     assert provider._manager is None
 
+    original_start = provider._start_session_init_background
     background_started = threading.Event()
     provider._start_session_init_background = background_started.set
     provider.sync_turn("hello", "world")
@@ -283,6 +284,7 @@ def test_honcho_tools_eager_init_failure_does_not_leave_ready_manager(monkeypatc
     assert provider._sync_thread is None
     assert not background_started.is_set()
 
+    provider._start_session_init_background = original_start
     result = json.loads(provider.handle_tool_call("honcho_profile", {"peer": "user"}))
     assert "could not be initialized" in result["error"]
     assert provider._manager is None
@@ -353,6 +355,7 @@ def test_honcho_tools_lazy_hooks_do_not_prestart_background_init(monkeypatch):
     )
 
     provider.initialize("session-1", platform="cli")
+    original_start = provider._start_session_init_background
     background_started = threading.Event()
     provider._start_session_init_background = background_started.set
 
@@ -363,6 +366,8 @@ def test_honcho_tools_lazy_hooks_do_not_prestart_background_init(monkeypatch):
 
     assert not background_started.is_set()
     assert provider._session_initialized is False
+
+    provider._start_session_init_background = original_start
 
     class ToolManager:
         def get_peer_card(self, session_key, peer="user"):

@@ -30,6 +30,15 @@ from .dialectic import DialecticMixin
 from .session_peers import assistant_peer_id_for, sanitize_peer_id
 from .session_context import usable_honcho_summary
 from .tool_schemas import ALL_TOOL_SCHEMAS
+from .startup import (
+    _STARTUP_WAIT_SECONDS,
+    normalize_profile_home,
+    recovery_binding,
+    retain_if_requested,
+    session_unavailable_text,
+    start_initializer,
+    turn_capture_allowed,
+)
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -182,6 +191,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         self._lazy_init_session_id: Optional[str] = None
         self._init_thread: Optional[threading.Thread] = None
         self._init_lock = threading.Lock()
+        self._init_failed = False
         # Init auth failures live here because the failed manager is discarded.
         self._init_auth_failure: Optional[str] = None
         self._init_auth_notice_emitted = False
@@ -266,9 +276,15 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
                 self._reasoning_level_cap = cfg.reasoning_level_cap
 
             # aiPeer comes from honcho.json only; SOUL.md is persona content, not identity config.
+            if not kwargs.get("hermes_home"):
+                from hermes_constants import get_hermes_home
+                kwargs["hermes_home"] = str(get_hermes_home())
+            kwargs["hermes_home"] = str(normalize_profile_home(kwargs["hermes_home"]))
             self._lazy_init_kwargs = dict(kwargs)
             self._lazy_init_session_id = session_id
             self._session_key = self._resolve_session_key(cfg, session_id, **kwargs)
+            self._startup_binding = recovery_binding(self)
+            self._lazy_init_kwargs["hermes_home"] = self._startup_binding["hermes_home"]
 
             # Session creation can block on Honcho/DB outages, so context/hybrid startup
             # fails open in a background thread. Tools-only mode has an explicit contract:
@@ -276,7 +292,9 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             if self._recall_mode != "tools":
                 self._start_session_init_background(wait_timeout=0.1)
             elif cfg.init_on_session_start:
-                self._ensure_session()
+                self._start_session_init_background(wait_timeout=_STARTUP_WAIT_SECONDS)
+                if not self._session_initialized:
+                    logger.warning("Honcho memory degraded: initialization pending; agent startup continues")
             else:
                 logger.debug("Honcho tools-only mode — deferring session init until first tool call")
         except ImportError:
@@ -344,10 +362,9 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             with self._init_lock if blocking else contextlib.nullcontext():
                 if not self._can_start_init() or (self._init_thread and self._init_thread.is_alive()):
                     return
-                self._init_thread = spawn_context_thread(lambda: self._run_session_init("background"),
-                                                         name="honcho-session-init", owner=self)
-                self._init_thread.start()
-                if wait_timeout > 0:
+                self._init_thread = start_initializer(
+                    self, lambda: self._run_session_init("background"), spawn_context_thread)
+                if self._init_thread and wait_timeout > 0:
                     self._init_thread.join(timeout=wait_timeout)
         finally:
             if not blocking:
@@ -359,7 +376,8 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             return True
         if not self._can_start_init() or (self._init_thread and self._init_thread.is_alive()):
             return False
-        return self._run_session_init("lazy") and self._manager is not None
+        self._start_session_init_background(wait_timeout=_STARTUP_WAIT_SECONDS)
+        return self._session_initialized and self._manager is not None
 
     def _do_session_init(self, cfg, session_id: str, **kwargs) -> None:
         """Shared session initialization for both eager and lazy paths."""
@@ -421,7 +439,8 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         """True when writes may proceed; otherwise (outside tools mode) start background init."""
         if self._session_ready():
             return True
-        if self._recall_mode != "tools":
+        if self._recall_mode != "tools" or (getattr(self._config, "init_on_session_start", False)
+                                           and not self._init_failed):
             self._start_session_init_background()
         return False
 
@@ -869,7 +888,12 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         if _is_internal_gateway_turn(user_content):
             logger.debug("Honcho sync skipped machine-generated gateway turn")
             return
+        author = turn_author if isinstance(turn_author, dict) else self._turn_author
+        if not turn_capture_allowed(self, author):
+            return
         if not self._ready_or_kick_init():
+            retain_if_requested(self, sanitize_context(user_content or "").strip(),
+                                sanitize_context(assistant_content or "").strip(), author)
             return
 
         msg_limit = self._config.message_max_chars if self._config else 25000
@@ -884,13 +908,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         session_kwargs: dict[str, str] = {}
         if author.get("is_bot"):
             # A bot's turn never lands in the human's session: its own a2a session or nothing.
-            if not getattr(self._config, "a2a_sessions", True):
-                logger.debug("Honcho sync skipped a bot-authored turn because a2aSessions is off")
-                return
             author_id = str(author.get("id") or "").strip()
-            if not author_id:
-                logger.debug("Honcho sync skipped a bot-authored turn that named no author id")
-                return
             bot_peer_id = self._manager.resolve_author_peer_id(
                 self._session_key, author_id, author.get("name"), is_bot=True)
             if not bot_peer_id or bot_peer_id == self._manager.assistant_peer_id():
@@ -1099,15 +1117,8 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
 
         if self._cron_skipped:
             return tool_error("Honcho is not active (cron context).")
-        if not self._session_initialized:
-            if self._init_thread and self._init_thread.is_alive():
-                return tool_error("Honcho session is still initializing; try again shortly.")
-            if not self._ensure_session():
-                if self._init_auth_failure:
-                    return tool_error(f"Honcho memory authentication failed: {self._init_auth_failure}")
-                if self._init_peer_failure:
-                    return tool_error(self._peer_failure_text())
-                return tool_error("Honcho session could not be initialized.")
+        if not self._session_initialized and not self._ensure_session():
+            return tool_error(session_unavailable_text(self))
         if not self._manager or not self._session_key:
             return tool_error("Honcho is not active for this session.")
         if (handler := self._TOOL_HANDLERS.get(tool_name)) is None:

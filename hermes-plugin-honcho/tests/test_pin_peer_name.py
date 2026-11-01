@@ -560,7 +560,11 @@ class TestPinTransition:
 
         cfg_path.write_text(json.dumps({**base, "hosts": {"hermes": {"workspace": "old"}}}))
         sig_old = provider.identity_signature()["workspace"]
+        stamp = cfg_path.stat()
         cfg_path.write_text(json.dumps({**base, "hosts": {"hermes": {"workspace": "new"}}}))
+        # Same-sized writes can share a filesystem clock tick; exercise a real stamp change.
+        import os
+        os.utime(cfg_path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2_000_000_000))
         sig_new = provider.identity_signature()["workspace"]
 
         assert (sig_old, sig_new) == ("old", "new")
