@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, TYPE_CHECKING
 
+from .receipts import ReceiptStore
 from .client import spawn_context_thread
 from .client import get_honcho_client
 from .session_auth import HonchoAuthError, SessionAuthMixin
@@ -440,14 +441,28 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
                         self._session_observation[session.honcho_session_id] = observation
             honcho_messages = []
             for m in new_messages:
+                metadata = {"metadata": {"hermes_receipt": {"id": m["receipt_id"], "part": m["receipt_part"]}}} if m.get("receipt_id") else {}
                 if m["role"] != "user":
-                    honcho_messages.append(assistant_peer.message(m["content"]))
+                    honcho_messages.append(assistant_peer.message(m["content"], **metadata))
                     continue
                 author_peer_id = m.get("author_peer_id")
                 peer = (self._author_peer_for_session(honcho_session, session.honcho_session_id, author_peer_id)
                         if author_peer_id else user_peer)
-                honcho_messages.append(peer.message(m["content"]))
-            honcho_session.add_messages(honcho_messages)
+                honcho_messages.append(peer.message(m["content"], **metadata))
+            returned = honcho_session.add_messages(honcho_messages)
+            ids = [m["receipt_id"] for m in new_messages if m.get("receipt_id")]
+            if ids:
+                try:
+                    from hermes_constants import get_hermes_home
+                    store = ReceiptStore(getattr(self._config, "hermes_home", None) or get_hermes_home())
+                    store.acknowledge(ids, returned)
+                except Exception as exc:
+                    logger.warning("Honcho acknowledgement receipt unavailable (%s)", type(exc).__name__)
+                    try:
+                        store.uncertain(ids, type(exc).__name__)
+                    except Exception:
+                        pass
+
             return len(honcho_messages)
 
         try:
@@ -455,6 +470,13 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
             ok = True
         except Exception as e:
             logger.error("Failed to sync messages to Honcho: %s", e)
+            ids = [m["receipt_id"] for m in new_messages if m.get("receipt_id")]
+            if ids:
+                try:
+                    from hermes_constants import get_hermes_home
+                    ReceiptStore(getattr(self._config, "hermes_home", None) or get_hermes_home()).uncertain(ids, type(e).__name__)
+                except Exception:
+                    logger.warning("Honcho failed-write receipt unavailable")
             ok = False
         for msg in new_messages:
             msg["_synced"] = ok
