@@ -779,9 +779,6 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         if _is_internal_gateway_turn(user_content):
             logger.debug("Honcho sync skipped machine-generated gateway turn")
             return
-        if not self._ready_or_kick_init():
-            return
-
         msg_limit = self._config.message_max_chars if self._config else 25000
         clean_user_content = sanitize_context(user_content or "").strip()
         clean_assistant_content = sanitize_context(assistant_content or "").strip()
@@ -790,7 +787,30 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         if not clean_user_content and not clean_assistant_content:
             return
 
-        author = turn_author if isinstance(turn_author, dict) else self._turn_author
+        author = dict(turn_author if isinstance(turn_author, dict) else self._turn_author)
+        # Persist human completion admission before provider initialization,
+        # peer lookup or asynchronous dispatch can fail. No content is stored.
+        chunks = [("user", c) for c in self._chunk_message(clean_user_content, msg_limit)] if clean_user_content else []
+        chunks += [("assistant", c) for c in self._chunk_message(clean_assistant_content, msg_limit)] if clean_assistant_content else []
+        receipt_id = None
+        try:
+            from hermes_constants import get_hermes_home
+            home = getattr(self._config, "hermes_home", None) or get_hermes_home()
+            store = ReceiptStore(home)
+            if not author.get("is_bot"):
+                receipt_id = store.begin(session_id, getattr(self._config, "workspace_id", ""), self._session_key,
+                                         [role for role, _ in chunks], human=True)
+        except Exception:
+            logger.warning("Honcho receipt admission unavailable")
+
+        if not self._ready_or_kick_init():
+            if receipt_id:
+                try:
+                    store.uncertain([receipt_id], "ProviderNotReady")
+                except Exception:
+                    logger.warning("Honcho provider-readiness receipt unavailable")
+            return
+
         session_kwargs: dict[str, str] = {}
         if author.get("is_bot"):
             # A bot's turn never lands in the human's session: its own a2a session or nothing.
@@ -814,20 +834,6 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             session_key = self._session_key
             # Resolved before the thread starts so a following turn cannot retag a queued write.
             author_peer_id = self._manager.resolve_author_peer_id(session_key, author.get("id"), author.get("name"))
-
-        # Persist the admitted completed-turn boundary BEFORE the asynchronous
-        # worker is queued. No content, prompt hashes or author names are stored.
-        chunks = [("user", c) for c in self._chunk_message(clean_user_content, msg_limit)] if clean_user_content else []
-        chunks += [("assistant", c) for c in self._chunk_message(clean_assistant_content, msg_limit)] if clean_assistant_content else []
-        receipt_id = None
-        try:
-            from hermes_constants import get_hermes_home
-            home = getattr(self._config, "hermes_home", None) or get_hermes_home()
-            store = ReceiptStore(home)
-            receipt_id = store.begin(session_id, self._config.workspace_id, session_key,
-                                     [role for role, _ in chunks], human=not author.get("is_bot", False))
-        except Exception:
-            logger.warning("Honcho receipt admission unavailable")
 
         def _sync():
             session = self._manager.get_or_create(session_key, **session_kwargs)

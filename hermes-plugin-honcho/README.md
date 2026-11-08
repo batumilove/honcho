@@ -477,7 +477,8 @@ Presets:
 ### Writer verification receipts
 
 Completed-turn invocations admitted by `sync_turn` receive a private, profile-bound
-receipt before the plugin queues its asynchronous write. Remote messages carry an
+receipt before provider initialization, peer resolution or asynchronous dispatch.
+A provider that is not ready leaves a durable unknown outcome. Remote messages carry an
 opaque receipt ID and part ordinal in `metadata.hermes_receipt`. The returned IDs
 are acknowledged only when echoed metadata and workspace/session identities match
 all parts. Receipts live under `cache/honcho-receipts/receipts.sqlite3`; they contain

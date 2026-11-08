@@ -82,3 +82,42 @@ def test_loader_and_writer_acknowledge_content_free_parts(tmp_path, monkeypatch)
             == 2
         )
     assert b"SENSITIVE" not in db.read_bytes()
+
+
+def test_provider_not_ready_is_durably_unknown(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+
+    def no_network(*a, **k):
+        raise AssertionError("network forbidden in receipt tests")
+
+    monkeypatch.setattr(socket.socket, "connect", no_network)
+    monkeypatch.setattr(socket, "create_connection", no_network)
+    from hermes_cli.plugins import PluginManager
+    from hermes_cli.plugins_manifest import PluginManifest
+
+    loader = PluginManager(scope_key=str(tmp_path))
+    module = loader._load_directory_module(
+        PluginManifest(
+            name="honcho", path=str(Path(__file__).parents[1]), source="user"
+        )
+    )
+    provider = module.HonchoMemoryProvider.__new__(module.HonchoMemoryProvider)
+    provider._config = SimpleNamespace(
+        hermes_home=tmp_path / "profile",
+        workspace_id="workspace",
+        message_max_chars=25000,
+    )
+    provider._session_key = "key"
+    provider._turn_author = {"is_bot": False}
+    provider._writes_enabled = lambda: True
+    provider._ready_or_kick_init = lambda: False
+    provider.sync_turn(
+        "SENSITIVE USER TEXT", "SENSITIVE ASSISTANT TEXT", session_id="local-session"
+    )
+    db = provider._config.hermes_home / "cache/honcho-receipts/receipts.sqlite3"
+    with sqlite3.connect(db) as connection:
+        assert connection.execute(
+            "SELECT status,error_class FROM turns"
+        ).fetchone() == ("unknown", "ProviderNotReady")
+    assert b"SENSITIVE" not in db.read_bytes()
