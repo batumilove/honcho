@@ -9,7 +9,7 @@ import re
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal, cast
@@ -77,7 +77,7 @@ def validated_headers(value: object) -> dict[str, str]:
 
 def _record(
     headers: object,
-    model: str,
+    model: object,
     endpoint: str,
     *,
     outcome: Literal["success", "error", "cancelled"] | None = None,
@@ -156,7 +156,9 @@ def _record(
 
 
 @contextmanager
-def request_attempt(headers: object, *, model: str, endpoint: str) -> Iterator[None]:
+def request_attempt(
+    headers: object, *, model: str, endpoint: str
+) -> Generator[None, None, None]:
     _record(headers, model, endpoint)
     try:
         yield
