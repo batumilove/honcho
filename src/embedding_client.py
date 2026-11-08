@@ -12,6 +12,7 @@ from google.genai import types as genai_types
 from openai import AsyncOpenAI
 
 from .config import EmbeddingModelConfig, resolve_embedding_model_config, settings
+from .request_receipts import request_attempt, request_headers
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +238,13 @@ class _EmbeddingClient:
             openai_kwargs: dict[str, Any] = {"model": self.model, "input": [query]}
             if self.send_dimensions:
                 openai_kwargs["dimensions"] = self.vector_dimensions
-            response = await openai_client.embeddings.create(**openai_kwargs)
+            openai_kwargs["extra_headers"] = request_headers(embedding=True)
+            with request_attempt(
+                openai_kwargs["extra_headers"],
+                model=self.model,
+                endpoint=str(getattr(openai_client, "base_url", "")),
+            ):
+                response = await openai_client.embeddings.create(**openai_kwargs)
             return self._validate_embedding_dimensions(response.data[0].embedding)
 
         return await _emit_embedding_call(
@@ -290,7 +297,13 @@ class _EmbeddingClient:
                     }
                     if self.send_dimensions:
                         openai_kwargs["dimensions"] = self.vector_dimensions
-                    response = await self.client.embeddings.create(**openai_kwargs)
+                    openai_kwargs["extra_headers"] = request_headers(embedding=True)
+                    with request_attempt(
+                        openai_kwargs["extra_headers"],
+                        model=self.model,
+                        endpoint=str(getattr(self.client, "base_url", "")),
+                    ):
+                        response = await self.client.embeddings.create(**openai_kwargs)
                     batch_embeddings.extend(
                         [
                             self._validate_embedding_dimensions(data.embedding)
@@ -455,7 +468,13 @@ class _EmbeddingClient:
                 }
                 if self.send_dimensions:
                     openai_kwargs["dimensions"] = self.vector_dimensions
-                response = await self.client.embeddings.create(**openai_kwargs)
+                openai_kwargs["extra_headers"] = request_headers(embedding=True)
+                with request_attempt(
+                    openai_kwargs["extra_headers"],
+                    model=self.model,
+                    endpoint=str(getattr(self.client, "base_url", "")),
+                ):
+                    response = await self.client.embeddings.create(**openai_kwargs)
                 for item, embedding_data in zip(batch, response.data, strict=True):
                     result[item.text_id][item.chunk_index] = (
                         self._validate_embedding_dimensions(embedding_data.embedding)

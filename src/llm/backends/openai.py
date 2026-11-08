@@ -14,6 +14,7 @@ from src.llm.structured_output import (
     repair_response_model_json,
     validate_structured_output,
 )
+from src.request_receipts import validated_headers
 
 logger = logging.getLogger(__name__)
 
@@ -322,9 +323,22 @@ class OpenAIBackend:
             ):
                 if key in extra_params:
                     params[key] = extra_params[key]
+            receipt_headers = validated_headers(
+                extra_params.get("honcho_receipt_headers")
+            )
+            if receipt_headers:
+                params["extra_headers"] = receipt_headers
             # Pass through unrecognized provider_params via extra_body
             # for vLLM chat_template_kwargs etc.
-            _known = {"top_p", "frequency_penalty", "presence_penalty", "seed", "verbosity", "json_mode"}
+            _known = {
+                "top_p",
+                "frequency_penalty",
+                "presence_penalty",
+                "seed",
+                "verbosity",
+                "json_mode",
+                "honcho_receipt_headers",
+            }
             for _k, _v in extra_params.items():
                 if _k not in _known:
                     params.setdefault("extra_body", {})[_k] = _v

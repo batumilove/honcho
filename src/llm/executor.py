@@ -20,6 +20,7 @@ from typing import Any, Literal, TypeVar, overload
 from pydantic import BaseModel
 
 from src.config import ModelConfig, ModelTransport
+from src.request_receipts import request_attempt, request_headers
 
 from .backend import CompletionResult as BackendCompletionResult
 from .backend import StreamChunk as BackendStreamChunk
@@ -318,6 +319,17 @@ async def honcho_llm_call_inner(
     # knobs — they pass through extra_params. execute_completion merges
     # build_config_extra_params(effective_config) on top for top_p/seed/etc.
     call_extras: dict[str, Any] = {"json_mode": json_mode, "verbosity": verbosity}
+    if provider == "openai":
+        call_extras["honcho_receipt_headers"] = request_headers(
+            telemetry.call_purpose if telemetry else None
+        )
+
+    receipt = request_attempt(
+        call_extras.get("honcho_receipt_headers"),
+        model=model,
+        endpoint=str(getattr(client, "base_url", "")),
+    )
+    receipt.__enter__()
 
     if stream:
         # Stream path: setup must run inside the awaited coroutine so it
@@ -344,6 +356,7 @@ async def honcho_llm_call_inner(
                 extra_params=call_extras,
             )
         except BaseException as exc:
+            receipt.__exit__(type(exc), exc, exc.__traceback__)
             _emit_llm_call_completed(
                 plan=plan,
                 telemetry=telemetry,
@@ -368,6 +381,11 @@ async def honcho_llm_call_inner(
                 stream_error = exc
                 raise
             finally:
+                receipt.__exit__(
+                    type(stream_error) if stream_error else None,
+                    stream_error,
+                    stream_error.__traceback__ if stream_error else None,
+                )
                 _emit_llm_call_completed(
                     plan=plan,
                     telemetry=telemetry,
@@ -404,6 +422,11 @@ async def honcho_llm_call_inner(
         error = exc
         raise
     finally:
+        receipt.__exit__(
+            type(error) if error else None,
+            error,
+            error.__traceback__ if error else None,
+        )
         _emit_llm_call_completed(
             plan=plan,
             telemetry=telemetry,
