@@ -9,9 +9,10 @@ import re
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 PURPOSE_STAGES = {
@@ -36,17 +37,20 @@ def request_headers(
         "X-Honcho-Request-ID": uuid.uuid4().hex,
         "X-Honcho-Stage": "embedding"
         if embedding
-        else PURPOSE_STAGES.get(purpose, "unattributed"),
+        else PURPOSE_STAGES.get(purpose, "unattributed")
+        if purpose
+        else "unattributed",
     }
     if purpose is not None:
         headers["X-Honcho-Call-Purpose"] = purpose
     return headers
 
 
-def validated_headers(value: Any) -> dict[str, str]:
+def validated_headers(value: object) -> dict[str, str]:
     """Never turn provider_params into arbitrary/authentication HTTP headers."""
     if not isinstance(value, dict):
         return {}
+    value = cast(dict[str, object], value)
     ident = value.get("X-Honcho-Request-ID")
     stage = value.get("X-Honcho-Stage")
     if (
@@ -71,7 +75,14 @@ def validated_headers(value: Any) -> dict[str, str]:
 # receive a request. Enable only with a private, persistent deployment bind.
 
 
-def _record(headers, model, endpoint, *, outcome=None, error=None):
+def _record(
+    headers: object,
+    model: str,
+    endpoint: str,
+    *,
+    outcome: Literal["success", "error", "cancelled"] | None = None,
+    error: BaseException | None = None,
+) -> None:
     path = os.environ.get("HONCHO_REQUEST_RECEIPT_PATH")
     safe = validated_headers(headers)
     if not path or not safe:
@@ -145,7 +156,7 @@ def _record(headers, model, endpoint, *, outcome=None, error=None):
 
 
 @contextmanager
-def request_attempt(headers, *, model, endpoint):
+def request_attempt(headers: object, *, model: str, endpoint: str) -> Iterator[None]:
     _record(headers, model, endpoint)
     try:
         yield
