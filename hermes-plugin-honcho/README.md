@@ -473,3 +473,19 @@ Presets:
   }
 }
 ```
+
+### Writer verification receipts
+
+Completed-turn invocations admitted by `sync_turn` receive a private, profile-bound
+receipt before the plugin queues its asynchronous write. Remote messages carry an
+opaque receipt ID and part ordinal in `metadata.hermes_receipt`. The returned IDs
+are acknowledged only when echoed metadata and workspace/session identities match
+all parts. Receipts live under `cache/honcho-receipts/receipts.sqlite3`; they contain
+no conversation text or content hashes. A consumer can independently match those
+identities against remote storage. This covers the admitted writer boundary,
+not every transcript row or turns rejected before provider admission.
+
+Partial/ambiguous replies remain unknown. Receipt failures do not block existing
+message writes, and receipts never authorize automatic replay. Successfully
+acknowledged receipts retain seven days; outstanding debt is retained. Preserve
+these databases across code rollback and respect the resolved profile home.
